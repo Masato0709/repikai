@@ -2,22 +2,26 @@
 (function () {
   'use strict';
   var C = self.RepiCore, DB = self.RepiDB;
+  var APP_VERSION = '1.1.0';
   var SITES = { amazon: 'Amazon', yodobashi: 'ヨドバシ.com', rakuten: '楽天', other: 'その他' };
   var SITE_KEYS = Object.keys(SITES);
   var DEFAULT_CATS = ['飲料', '食品', '洗剤・掃除', '紙類', '衛生用品', 'その他'];
+  var CYCLE_PRESETS = [7, 14, 30, 60, 90];
+  var CONFIRM_MODES = ['ask', 'auto', 'none'];
   var WD = '日月火水木金土';
   var app = document.getElementById('app');
   var modalRoot = document.getElementById('modal-root');
   var toastEl = document.getElementById('toast');
 
-  var APP_VERSION = '1.0.0';
-  var lastVerCheck = 0;
   var state = null;
   var memoryOnly = false;
   var deferredInstall = null;
   var syncStatus = 'unknown';
+  var lastVerCheck = 0;
   var ui = { site: 'all', cat: null, q: '', drawer: false };
-  var form = { photo: undefined };
+  var form = { photo: undefined, fromShare: false };
+  var sharePhoto = null;
+  var pendingConfirm = null;
   var buyWatch = null;
 
   /* ---------- アイコン ---------- */
@@ -37,7 +41,10 @@
     list: svg('<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>', 20),
     hist: svg('<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>', 20),
     gear: svg('<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/>', 20),
-    cart: svg('<path d="M3 4h2l2.4 10.2a1 1 0 0 0 1 .8h8.9a1 1 0 0 0 1-.8L20 8H6.2"/><circle cx="9" cy="19" r="1.5"/><circle cx="17" cy="19" r="1.5"/>', 40)
+    share: svg('<circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="M8.2 10.8l7.6-4.4M8.2 13.2l7.6 4.4"/>', 20),
+    cycle: svg('<path d="M20 12a8 8 0 0 1-14.3 4.9"/><path d="M4 12A8 8 0 0 1 18.3 7.1"/><path d="M18 3v4.5h-4.5"/><path d="M6 21v-4.5h4.5"/>', 20),
+    cart: svg('<path d="M3 4h2l2.4 10.2a1 1 0 0 0 1 .8h8.9a1 1 0 0 0 1-.8L20 8H6.2"/><circle cx="9" cy="19" r="1.5"/><circle cx="17" cy="19" r="1.5"/>', 40),
+    photo: svg('<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-8 8"/>', 40)
   };
 
   /* 商品イラスト（写真がないとき） */
@@ -64,6 +71,8 @@
   function isDate(s) { return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s); }
   function clampInt(v, lo, hi, d) { var n = parseInt(v, 10); if (isNaN(n)) return d; return Math.min(hi, Math.max(lo, n)); }
   function numOrNull(v) { if (v === '' || v == null) return null; var n = Number(v); return isNaN(n) ? null : Math.max(0, Math.round(n)); }
+  function str(v, max) { return typeof v === 'string' ? v.trim().slice(0, max) : ''; }
+  function okId(v) { return typeof v === 'string' && /^[a-z0-9]{4,40}$/i.test(v); }
   function safeUrl(u) {
     try { var x = new URL(u); return (x.protocol === 'https:' || x.protocol === 'http:') ? x.href : null; } catch (e) { return null; }
   }
@@ -76,57 +85,126 @@
     } catch (e) { /* 入力途中 */ }
     return null;
   }
-  function siteLabel(it) { return SITES[it.site] || 'その他'; }
-  function buyLabel(it) { return it.site === 'other' ? 'サイトで購入する' : siteLabel(it) + 'で購入する'; }
+  function amazonAsin(x) {
+    var m = x.pathname.match(/\/(?:dp|gp\/product|gp\/aw\/d|o\/ASIN)\/([A-Z0-9]{10})(?:[/?]|$)/i);
+    return m ? m[1].toUpperCase() : null;
+  }
+  /* 保存するリンクを整える（Amazonは短い形にする） */
+  function tidyUrl(u) {
+    var s = safeUrl(u);
+    if (!s) return null;
+    var x = new URL(s);
+    if (/(^|\.)amazon\.co\.jp$/.test(x.hostname)) {
+      var a = amazonAsin(x);
+      if (a) return 'https://www.amazon.co.jp/dp/' + a;
+    }
+    return s;
+  }
+  /* 同じ商品かどうかを見分けるための鍵 */
+  function urlKey(u) {
+    var s = safeUrl(u || '');
+    if (!s) return '';
+    var x = new URL(s);
+    if (/amazon\./.test(x.hostname)) { var a = amazonAsin(x); if (a) return 'amazon:' + a; }
+    return x.hostname.replace(/^www\./, '') + x.pathname.replace(/\/+$/, '');
+  }
+  /* 共有で届いた題名から、お店の名前などの余分な文字を取り除く */
+  function cleanTitle(t, site) {
+    t = String(t || '').replace(/\s+/g, ' ').trim();
+    t = t.replace(/^Amazon\.co\.jp\s*[:：]\s*/i, '').replace(/^Amazon\s*[|｜]\s*/i, '');
+    if (site === 'amazon') { var i = t.lastIndexOf(' : '); if (i > 4) t = t.slice(0, i); }
+    t = t.replace(/^【楽天市場】\s*/, '');
+    if (site === 'rakuten') { var j = t.lastIndexOf('：'); if (j > 4) t = t.slice(0, j); }
+    t = t.replace(/^ヨドバシ\.com\s*[-－]\s*/, '').replace(/\s*通販\s*【[^】]*】.*$/, '').replace(/\s*通販$/, '');
+    t = t.replace(/\s*[-－|｜]\s*(Amazon\.co\.jp|ヨドバシ\.com|楽天市場)\s*$/i, '');
+    return t.trim().slice(0, 60);
+  }
+  function findUrl(s) { var m = String(s || '').match(/https?:\/\/[^\s"'<>]+/); return m ? m[0] : ''; }
 
   var toastT;
   function toast(msg) {
     toastEl.textContent = msg;
     toastEl.classList.add('show');
     clearTimeout(toastT);
-    toastT = setTimeout(function () { toastEl.classList.remove('show'); }, 2600);
+    toastT = setTimeout(function () { toastEl.classList.remove('show'); }, 2800);
   }
 
   /* ---------- データ ---------- */
+  /* 1つの「品目」に、1つ以上の「銘柄」（お店の商品ページ）がぶら下がる形で持つ */
   function defaultState() {
-    return { version: 1, items: [], categories: DEFAULT_CATS.slice(), settings: { quietStart: 22, quietEnd: 9, notifyEnabled: false }, pending: null, notified: {} };
+    return {
+      version: 2, items: [], categories: DEFAULT_CATS.slice(),
+      settings: { quietStart: 22, quietEnd: 9, notifyEnabled: false, confirmMode: 'ask' },
+      pending: [], notified: {}, lastShared: null
+    };
   }
-  function okId(v) { return typeof v === 'string' && /^[a-z0-9]{4,40}$/i.test(v); }
+  function normVariant(v) {
+    return {
+      id: okId(v.id) ? v.id : uid(),
+      name: str(v.name, 60) || '名前なし',
+      url: tidyUrl(v.url || '') || '',
+      site: SITE_KEYS.indexOf(v.site) >= 0 ? v.site : 'other',
+      image: typeof v.image === 'string' && v.image.indexOf('data:image/') === 0 ? v.image : null,
+      price: numOrNull(v.price),
+      createdAt: String(v.createdAt || new Date().toISOString())
+    };
+  }
+  function normEntry(it, cats) {
+    var isV1 = !Array.isArray(it.variants) || !it.variants.length;
+    var variants = isV1
+      ? [normVariant({ id: uid(), name: it.name, url: it.url, site: it.site, image: it.image, price: it.price, createdAt: it.createdAt })]
+      : it.variants.map(normVariant);
+    var seen = {};
+    variants = variants.filter(function (v) { if (seen[v.id]) return false; seen[v.id] = 1; return true; });
+    var vids = variants.map(function (v) { return v.id; });
+    return {
+      id: okId(it.id) ? it.id : uid(),
+      name: isV1 ? '' : str(it.name, 30),
+      category: typeof it.category === 'string' && it.category ? it.category.slice(0, 20) : cats[0],
+      must: it.must !== false,
+      cycle: clampInt(it.cycle, 1, 365, 7),
+      notifyBefore: clampInt(it.notifyBefore, 0, 30, 1),
+      snoozeUntil: isDate(it.snoozeUntil) ? it.snoozeUntil : null,
+      suggestOff: typeof it.suggestOff === 'number' && it.suggestOff >= 0 ? Math.floor(it.suggestOff) : null,
+      createdAt: String(it.createdAt || new Date().toISOString()),
+      variants: variants,
+      history: Array.isArray(it.history) ? it.history.filter(function (h) { return h && isDate(h.date); }).map(function (h) {
+        return {
+          id: okId(h.id) ? h.id : uid(), date: h.date, t: String(h.t || ''), price: numOrNull(h.price),
+          source: h.source === 'app' ? 'app' : 'manual',
+          variantId: vids.indexOf(h.variantId) >= 0 ? h.variantId : vids[0]
+        };
+      }) : []
+    };
+  }
   function normalize(s) {
     if (!s || !Array.isArray(s.items)) throw new Error('bad data');
     var cats = Array.isArray(s.categories) ? s.categories.filter(function (c) { return typeof c === 'string' && c.trim(); }).map(function (c) { return c.trim().slice(0, 20); }) : [];
     if (!cats.length) cats = DEFAULT_CATS.slice();
-    var items = s.items.map(function (it) {
-      return {
-        id: okId(it.id) ? it.id : uid(),
-        name: String(it.name || '名前なし').slice(0, 60),
-        url: safeUrl(it.url || '') || '',
-        site: SITE_KEYS.indexOf(it.site) >= 0 ? it.site : 'other',
-        category: typeof it.category === 'string' ? it.category.slice(0, 20) : cats[0],
-        must: it.must !== false,
-        cycle: clampInt(it.cycle, 1, 365, 7),
-        notifyBefore: clampInt(it.notifyBefore, 0, 30, 1),
-        price: numOrNull(it.price),
-        image: typeof it.image === 'string' && it.image.indexOf('data:image/') === 0 ? it.image : null,
-        snoozeUntil: isDate(it.snoozeUntil) ? it.snoozeUntil : null,
-        createdAt: String(it.createdAt || new Date().toISOString()),
-        history: Array.isArray(it.history) ? it.history.filter(function (h) { return h && isDate(h.date); }).map(function (h) {
-          return { id: okId(h.id) ? h.id : uid(), date: h.date, t: String(h.t || ''), price: numOrNull(h.price), source: h.source === 'app' ? 'app' : 'manual' };
-        }) : []
-      };
-    });
     var st = s.settings || {};
     return {
-      version: 1, items: items, categories: cats,
-      settings: { quietStart: clampInt(st.quietStart, 0, 23, 22), quietEnd: clampInt(st.quietEnd, 0, 23, 9), notifyEnabled: !!st.notifyEnabled },
-      pending: null, notified: {}
+      version: 2,
+      items: s.items.filter(function (it) { return it && typeof it === 'object'; }).map(function (it) { return normEntry(it, cats); }),
+      categories: cats,
+      settings: {
+        quietStart: clampInt(st.quietStart, 0, 23, 22), quietEnd: clampInt(st.quietEnd, 0, 23, 9),
+        notifyEnabled: !!st.notifyEnabled,
+        confirmMode: CONFIRM_MODES.indexOf(st.confirmMode) >= 0 ? st.confirmMode : 'ask'
+      },
+      pending: [], notified: {}, lastShared: null
     };
   }
   function normalizeLoaded(s) {
     var n = normalize(s);
-    if (s.pending && okId(s.pending.itemId) && okId(s.pending.histId)) n.pending = { itemId: s.pending.itemId, histId: s.pending.histId, at: Number(s.pending.at) || 0 };
+    var pend = Array.isArray(s.pending) ? s.pending : (s.pending ? [s.pending] : []);
+    n.pending = pend.filter(function (p) { return p && okId(p.itemId) && okId(p.histId); }).map(function (p) {
+      return { itemId: p.itemId, histId: p.histId, at: Number(p.at) || 0 };
+    });
     if (s.notified && typeof s.notified === 'object') {
       Object.keys(s.notified).forEach(function (k) { if (okId(k) && isDate(s.notified[k])) n.notified[k] = s.notified[k]; });
+    }
+    if (s.lastShared && okId(s.lastShared.itemId) && okId(s.lastShared.variantId)) {
+      n.lastShared = { itemId: s.lastShared.itemId, variantId: s.lastShared.variantId, at: Number(s.lastShared.at) || 0 };
     }
     return n;
   }
@@ -137,27 +215,48 @@
   }
 
   function getItem(id) { return state.items.find(function (i) { return i.id === id; }); }
-  function sortedHistory(it) {
-    return it.history.slice().sort(function (a, b) {
+  function getVariant(e, vid) { return e.variants.find(function (v) { return v.id === vid; }) || null; }
+  function sortedHistory(e) {
+    return e.history.slice().sort(function (a, b) {
       return a.date === b.date ? String(b.t).localeCompare(String(a.t)) : b.date.localeCompare(a.date);
     });
   }
-  function priced(it) { return sortedHistory(it).filter(function (h) { return h.price != null; }); }
-  function lastPrice(it) { var p = priced(it); return p.length ? p[0].price : it.price; }
-  function prevPrice(it) { var p = priced(it); return p.length > 1 ? p[1].price : null; }
-  function avgInterval(it) {
-    var ds = Array.from(new Set(it.history.map(function (h) { return h.date; }))).sort().slice(-11);
+  /* 次に買う銘柄 = 最後に買った銘柄 */
+  function curVariant(e) {
+    var hs = sortedHistory(e);
+    for (var i = 0; i < hs.length; i++) { var v = getVariant(e, hs[i].variantId); if (v) return v; }
+    return e.variants[0];
+  }
+  function multi(e) { return e.variants.length > 1; }
+  function vCount(e, v) { return e.history.filter(function (h) { return h.variantId === v.id; }).length; }
+  function vPriced(e, v) { return sortedHistory(e).filter(function (h) { return h.variantId === v.id && h.price != null; }); }
+  function vLastPrice(e, v) { var p = vPriced(e, v); return p.length ? p[0].price : v.price; }
+  function vPrevPrice(e, v) { var p = vPriced(e, v); return p.length > 1 ? p[1].price : null; }
+  function avgInterval(e) {
+    var ds = Array.from(new Set(e.history.map(function (h) { return h.date; }))).sort().slice(-11);
     if (ds.length < 3) return null;
     var sum = 0;
     for (var i = 1; i < ds.length; i++) sum += C.diffDays(ds[i], ds[i - 1]);
     return Math.round(sum / (ds.length - 1) * 10) / 10;
   }
-  function status(it) {
-    var d = C.dueInfo(it, C.todayStr());
-    var never = !it.history.length;
+  /* 周期の提案：3回以上買っていて、設定と2割以上ずれているときだけ */
+  function suggestion(e) {
+    if (!e.must) return null;
+    var avg = avgInterval(e);
+    if (!avg) return null;
+    var to = Math.max(1, Math.round(avg));
+    if (to === e.cycle || Math.abs(avg - e.cycle) / e.cycle < 0.2) return null;
+    if (e.suggestOff != null && e.history.length <= e.suggestOff) return null;
+    return { avg: avg, to: to };
+  }
+  function status(e) {
+    var today = C.todayStr();
+    var d = C.dueInfo(e, today);
+    var never = !e.history.length;
     var level, label;
-    if (!it.must) { level = 'occ'; label = d.last ? '前回 ' + fmtMD(d.last) : '未購入'; }
+    if (!e.must) { level = 'occ'; label = d.last ? '前回 ' + fmtMD(d.last) : '未購入'; }
     else if (never) { level = 'hot'; label = '未購入'; }
+    else if (C.isStale(e, today)) { level = 'stale'; label = C.diffDays(today, d.last) + '日買っていない'; }
     else if (d.left < 0) { level = 'over'; label = (-d.left) + '日過ぎ'; }
     else if (d.left === 0) { level = 'hot'; label = '今日'; }
     else if (d.left <= 3) { level = 'warm'; label = 'あと' + d.left + '日'; }
@@ -171,12 +270,21 @@
     if (cat === '衛生用品') return 'bottle';
     return 'box';
   }
-  function tintOf(it) {
+  function tintOf(id) {
     var h = 0;
-    for (var i = 0; i < it.id.length; i++) h = (h * 31 + it.id.charCodeAt(i)) >>> 0;
+    for (var i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
     return 'var(--tint' + (h % 3 + 1) + ')';
   }
-  function thumb(it) { return it.image ? '<img src="' + esc(it.image) + '" alt="">' : IL[kindOf(it.category)]; }
+  function thumbInner(v, cat) { return v && v.image ? '<img src="' + esc(v.image) + '" alt="">' : IL[kindOf(cat)]; }
+  function siteLabel(v) { return SITES[v.site] || 'その他'; }
+  function buyLabel(v) { return v.site === 'other' ? 'サイトで購入する' : siteLabel(v) + 'で購入する'; }
+  /* 購入ボタンは本物のリンク（ブラウザで商品ページが開く） */
+  function buyAttrs(e, v) {
+    var u = safeUrl(v.url || '');
+    var base = 'data-action="buy" data-id="' + esc(e.id) + '" data-vid="' + esc(v.id) + '"';
+    return u ? 'href="' + esc(u) + '" target="_blank" rel="noopener" ' + base : 'href="#" data-nolink="1" ' + base;
+  }
+  function entryLabel(e) { return e.name || curVariant(e).name; }
 
   /* ---------- 画面の枠 ---------- */
   function route() {
@@ -187,16 +295,11 @@
     if (h === 'all-items') return { name: 'items' };
     return { name: 'home' };
   }
-  /* 購入ボタンは本物のリンクにする（Androidでは各社のアプリでも開ける） */
-  function buyAttrs(it) {
-    var u = safeUrl(it.url || '');
-    return u ? 'href="' + esc(u) + '" target="_blank" rel="noopener"' : 'href="#" data-nolink="1"';
-  }
   function counts() {
     var today = 0, soon = 0;
-    state.items.forEach(function (it) {
-      if (!it.must) return;
-      var s = status(it);
+    state.items.forEach(function (e) {
+      if (!e.must) return;
+      var s = status(e);
       if (s.level === 'hot' || s.level === 'over') today++;
       else if (s.level === 'warm') soon++;
     });
@@ -240,13 +343,24 @@
   /* ---------- ホーム ---------- */
   function filtered() {
     var q = ui.q.trim().toLowerCase();
-    return state.items.filter(function (it) {
-      return (ui.site === 'all' || it.site === ui.site) && (!ui.cat || it.category === ui.cat) && (!q || it.name.toLowerCase().indexOf(q) >= 0);
+    return state.items.filter(function (e) {
+      var siteOk = ui.site === 'all' || e.variants.some(function (v) { return v.site === ui.site; });
+      var qOk = !q || (e.name || '').toLowerCase().indexOf(q) >= 0 || e.variants.some(function (v) { return v.name.toLowerCase().indexOf(q) >= 0; });
+      return siteOk && qOk && (!ui.cat || e.category === ui.cat);
     });
   }
   function installHint() {
     if (!deferredInstall) return '';
-    return '<div class="hint"><span>ホーム画面に追加すると、アプリのように使えて通知も届きやすくなります</span><button class="btn-sub" data-action="install">追加する</button></div>';
+    return '<div class="hint"><span>ホーム画面に追加すると、アプリのように使えて、共有からの登録や通知も使えます</span><button class="btn-sub" data-action="install">追加する</button></div>';
+  }
+  function suggestBanner() {
+    var cands = state.items.map(function (e) { return { e: e, s: suggestion(e) }; }).filter(function (x) { return x.s && !C.isStale(x.e); });
+    if (!cands.length) return '';
+    cands.sort(function (a, b) { return b.e.history.length - a.e.history.length; });
+    var x = cands[0], eid = esc(x.e.id);
+    return '<div class="sug-banner">' + ICON.cycle + '<span><b>' + esc(entryLabel(x.e)) + '</b> は、実際は平均 <b>' + x.s.avg + '日</b> ごとに買っています。周期を ' + x.e.cycle + '日 → <b>' + x.s.to + '日</b> に変えますか？</span>' +
+      '<div class="sug-actions"><button class="btn-sub" data-action="applyAvg" data-id="' + eid + '">' + x.s.to + '日ごとにする</button>' +
+      '<button class="link-btn" data-action="dismissSuggest" data-id="' + eid + '">今は変えない</button></div></div>';
   }
   function viewHome() {
     var tabs = ['all', 'amazon', 'yodobashi', 'rakuten'].map(function (k) {
@@ -256,96 +370,128 @@
       '<nav class="nav" aria-label="絞り込み">' + tabs +
       '<button data-action="catPick" class="' + (ui.cat ? 'on' : '') + '">' + (ui.cat ? 'カテゴリー：' + esc(ui.cat) : 'カテゴリー') + '</button>' +
       '<a href="#history">購入履歴</a></nav>' +
-      '<div class="wrap"><div class="ttl"><h1>そろそろ買う</h1><small>REPEAT ITEMS</small></div>' + installHint() +
+      '<div class="wrap"><div class="ttl"><h1>そろそろ買う</h1><small>REPEAT ITEMS</small></div>' + installHint() + suggestBanner() +
       '<div id="home-body">' + homeBody() + '</div></div>';
   }
   function homeBody() {
     if (!state.items.length) return emptyState();
     var list = filtered();
     if (!list.length) return '<p class="empty-col center">条件に合う商品がありません</p>';
-    var all = list.map(function (it) { return { it: it, s: status(it) }; });
-    var must = all.filter(function (x) { return x.it.must; }).sort(function (a, b) { return a.s.left - b.s.left; });
+    var all = list.map(function (e) { return { e: e, s: status(e) }; });
+    var bySoon = function (a, b) { return (a.s.left - b.s.left) || (b.e.history.length - a.e.history.length); };
+    var must = all.filter(function (x) { return x.e.must && x.s.level !== 'stale'; }).sort(bySoon);
     var today = must.filter(function (x) { return x.s.level === 'hot' || x.s.level === 'over'; });
     var soon = must.filter(function (x) { return x.s.level === 'warm'; });
     var later = must.filter(function (x) { return x.s.level === 'calm'; });
-    var occ = all.filter(function (x) { return !x.it.must; });
+    var occ = all.filter(function (x) { return !x.e.must; }).sort(function (a, b) { return b.e.history.length - a.e.history.length; });
+    var stale = all.filter(function (x) { return x.s.level === 'stale'; }).sort(function (a, b) { return a.s.left - b.s.left; });
     function col(title, cls, arr) {
       return '<section class="col"><div class="col-h"><span class="dot ' + cls + '"></span>' + title + '<span class="cnt">' + arr.length + '</span></div>' +
         (arr.length ? arr.map(function (x, i) { return rowHtml(x, i + 1); }).join('') : '<p class="empty-col">ありません</p>') + '</section>';
     }
-    var html = '<div class="cols">' + col('今日・期限切れ', 'hot', today) + col('3日以内', 'warm', soon) + col('それ以降', 'calm', later) + '</div>';
-    if (occ.length) {
-      html += '<section class="occ"><div class="col-h"><span class="dot calm"></span>たまに買う<span class="note-inline">通知なし</span><span class="cnt">' + occ.length + '</span></div>' +
-        '<div class="occ-grid">' + occ.map(occHtml).join('') + '</div></section>';
+    function sub(title, note, arr) {
+      return '<section class="occ"><div class="col-h"><span class="dot calm"></span>' + title + '<span class="note-inline">' + note + '</span><span class="cnt">' + arr.length + '</span></div>' +
+        '<div class="occ-grid">' + arr.map(cardHtml).join('') + '</div></section>';
     }
+    var html = '<div class="cols">' + col('今日・期限切れ', 'hot', today) + col('3日以内', 'warm', soon) + col('それ以降', 'calm', later) + '</div>';
+    if (occ.length) html += sub('たまに買う', '通知なし', occ);
+    if (stale.length) html += sub('最近買っていない', '通知を止めています。買うと元に戻ります', stale);
     return html;
   }
-  function rowHtml(x, n) {
-    var it = x.it, s = x.s, id = esc(it.id);
-    var snooze = (s.level !== 'calm' && !s.never) ? '<button class="link-btn" data-action="snooze" data-id="' + id + '">まだある</button>' : '';
-    return '<div class="row"><a class="thumb" href="#item-' + id + '" style="background:' + tintOf(it) + '" aria-label="' + esc(it.name) + 'の詳細">' + thumb(it) + '</a>' +
-      '<div class="row-body"><div class="row-top"><span class="no">' + n + '</span><span class="site">' + siteLabel(it) + '</span>' + snooze + '</div>' +
-      '<a class="row-name" href="#item-' + id + '">' + esc(it.name) + '</a>' +
-      '<div class="row-meta"><span>' + yen(lastPrice(it)) + '</span><span class="tag ' + s.level + '">' + s.label + '</span>' +
-      '<a class="btn-buy ' + s.level + '" ' + buyAttrs(it) + ' data-action="buy" data-id="' + id + '">購入する</a></div></div></div>';
+  function brandLine(e) {
+    if (!multi(e)) return '';
+    return '<div class="brand-line"><span>' + esc(e.name) + ' ・ 銘柄' + e.variants.length + '</span><button class="link-btn" data-action="brands" data-id="' + esc(e.id) + '">ほかの銘柄</button></div>';
   }
-  function occHtml(x) {
-    var it = x.it, id = esc(it.id);
-    return '<div class="occ-card"><a class="thumb" href="#item-' + id + '" style="background:' + tintOf(it) + '" aria-label="' + esc(it.name) + 'の詳細">' + thumb(it) + '</a>' +
-      '<div class="occ-body"><a class="row-name" href="#item-' + id + '">' + esc(it.name) + '</a><span class="occ-meta">' + siteLabel(it) + ' ・ ' + x.s.label + '</span></div>' +
-      '<a class="btn-buy occ" ' + buyAttrs(it) + ' data-action="buy" data-id="' + id + '">購入する</a></div>';
+  function rowHtml(x, n) {
+    var e = x.e, s = x.s, v = curVariant(e), id = esc(e.id);
+    var snooze = (s.level !== 'calm' && !s.never) ? '<button class="link-btn" data-action="snooze" data-id="' + id + '">まだある</button>' : '';
+    return '<div class="row"><a class="thumb" href="#item-' + id + '" style="background:' + tintOf(v.id) + '" aria-label="' + esc(v.name) + 'の詳細">' + thumbInner(v, e.category) + '</a>' +
+      '<div class="row-body"><div class="row-top"><span class="no">' + n + '</span><span class="site">' + siteLabel(v) + '</span><span class="times">購入' + e.history.length + '回</span>' + snooze + '</div>' +
+      '<a class="row-name" href="#item-' + id + '">' + esc(v.name) + '</a>' + brandLine(e) +
+      '<div class="row-meta"><span>' + yen(vLastPrice(e, v)) + '</span><span class="tag ' + s.level + '">' + s.label + '</span>' +
+      '<a class="btn-buy ' + s.level + '" ' + buyAttrs(e, v) + '>購入する</a></div></div></div>';
+  }
+  function cardHtml(x) {
+    var e = x.e, v = curVariant(e), id = esc(e.id);
+    return '<div class="occ-card"><a class="thumb" href="#item-' + id + '" style="background:' + tintOf(v.id) + '" aria-label="' + esc(v.name) + 'の詳細">' + thumbInner(v, e.category) + '</a>' +
+      '<div class="occ-body"><a class="row-name" href="#item-' + id + '">' + esc(v.name) + '</a><span class="occ-meta">' + siteLabel(v) + ' ・ 購入' + e.history.length + '回 ・ ' + x.s.label + '</span></div>' +
+      '<a class="btn-buy occ" ' + buyAttrs(e, v) + '>購入する</a></div>';
+  }
+  function shareHowTo() {
+    return '<ol class="howto"><li>Chromeで商品ページを開き、右上の「⋮」→「共有」→「<b>リピ買い</b>」を選ぶ</li>' +
+      '<li>商品名とリンクが入った登録画面が開くので、周期を選んで保存する</li>' +
+      '<li>続けて、商品写真を長押し→「画像を共有」→「<b>リピ買い</b>」で写真が付く</li></ol>';
   }
   function emptyState() {
     return '<div class="empty"><div class="thumb xl" style="background:var(--tint1)">' + IL.water + '</div>' +
       '<h2>まだ商品が登録されていません</h2>' +
       '<p>よく買う日用品と、その商品ページのリンクを登録しましょう。<br>買う周期に合わせて、買いどきをお知らせします。</p>' +
-      '<div class="empty-actions"><button class="btn-primary" data-action="add">最初の商品を登録する</button>' +
+      '<div class="howto-box"><b>かんたんな登録のしかた</b>' + shareHowTo() + '</div>' +
+      '<div class="empty-actions"><button class="btn-primary" data-action="add">手で登録する</button>' +
       '<button class="btn-ghost" data-action="sample">サンプルで試してみる</button></div></div>';
   }
 
   /* ---------- 商品詳細 ---------- */
+  function cycleChips(action, cur, eid) {
+    return '<div class="chips" role="group" aria-label="よく使う周期">' + CYCLE_PRESETS.map(function (d) {
+      return '<button type="button" class="chip' + (d === cur ? ' on' : '') + '" data-action="' + action + '" data-v="' + d + '"' + (eid ? ' data-id="' + eid + '"' : '') + '>' + d + '日</button>';
+    }).join('') + '</div>';
+  }
   function viewItem(id) {
-    var it = getItem(id);
-    if (!it) return '<div class="wrap"><p>商品が見つかりません。</p><a href="#home">ホームへ戻る</a></div>';
-    var s = status(it), eid = esc(it.id);
-    var lp = lastPrice(it), pp = prevPrice(it);
+    var e = getItem(id);
+    if (!e) return '<div class="wrap"><p>商品が見つかりません。</p><a href="#home">ホームへ戻る</a></div>';
+    var s = status(e), eid = esc(e.id), v = curVariant(e), vid = esc(v.id);
+    var lp = vLastPrice(e, v), pp = vPrevPrice(e, v);
     var diff = (lp != null && pp != null && lp !== pp) ? ' <span class="muted">（前々回 ' + yen(pp) + ' から ' + (lp > pp ? '+' : '−') + '¥' + Math.abs(lp - pp).toLocaleString('ja-JP') + '）</span>' : '';
-    var avg = avgInterval(it), suggest;
-    if (avg && Math.round(avg) !== it.cycle) {
-      suggest = '<div class="suggest"><span>実際は平均 <b>' + avg + '日</b> ごとに買っています</span><button class="btn-sub" data-action="applyAvg" data-id="' + eid + '">' + Math.round(avg) + '日ごとにする</button></div>';
+    var sg = suggestion(e), avg = avgInterval(e), suggestHtml;
+    if (sg) {
+      suggestHtml = '<div class="suggest"><span>実際は平均 <b>' + sg.avg + '日</b> ごとに買っています</span><button class="btn-sub" data-action="applyAvg" data-id="' + eid + '">' + sg.to + '日ごとにする</button><button class="link-btn" data-action="dismissSuggest" data-id="' + eid + '">今は変えない</button></div>';
     } else if (avg) {
-      suggest = '<div class="suggest calm">実際の平均は ' + avg + '日 で、設定どおりです</div>';
+      suggestHtml = '<div class="suggest calm">実際の平均は ' + avg + '日 です</div>';
     } else {
-      suggest = '<div class="suggest calm">3回以上買うと、実際の周期を自動で計算します</div>';
+      suggestHtml = '<div class="suggest calm">3回以上買うと、実際の周期を計算して、ずれが大きいときにお知らせします</div>';
     }
-    var hs = sortedHistory(it);
+    var hs = sortedHistory(e);
     var rows = hs.map(function (h, i) {
-      var nx = hs[i + 1];
+      var nx = hs[i + 1], hv = getVariant(e, h.variantId);
       var gap = nx ? '前回から' + C.diffDays(h.date, nx.date) + '日' : 'はじめての記録';
       return '<div class="hrow"><div class="hdate"><b>' + fmtMDW(h.date) + '</b><small>' + gap + '</small></div>' +
-        '<span class="hprice">' + yen(h.price) + '</span><span class="hsrc">' + (h.source === 'app' ? 'アプリから' : '手動') + '</span>' +
+        '<span class="hprice">' + yen(h.price) + (multi(e) && hv ? '<small>' + esc(hv.name) + '</small>' : '') + '</span><span class="hsrc">' + (h.source === 'app' ? 'アプリから' : '手動') + '</span>' +
         '<button class="icon-btn sm" data-action="editHist" data-id="' + eid + '" data-hid="' + esc(h.id) + '" aria-label="この履歴を編集">' + ICON.pencil + '</button></div>';
     }).join('');
-    var nb = it.notifyBefore === 0 ? '当日' : it.notifyBefore + '日前';
+    var nb = e.notifyBefore === 0 ? '当日' : e.notifyBefore + '日前';
+    var brands = multi(e) ? '<section class="card"><h2>銘柄 <span class="muted small">次は最後に買った銘柄を表示します</span></h2><div class="vlist">' +
+      e.variants.map(function (x) {
+        return '<div class="vrow' + (x.id === v.id ? ' cur' : '') + '"><span class="thumb sm" style="background:' + tintOf(x.id) + '">' + thumbInner(x, e.category) + '</span>' +
+          '<span class="g-name">' + esc(x.name) + '<small>' + siteLabel(x) + ' ・ 購入' + vCount(e, x) + '回 ・ ' + yen(vLastPrice(e, x)) + (x.id === v.id ? ' ・ 前回買った銘柄' : '') + '</small></span>' +
+          '<button class="icon-btn sm" data-action="edit" data-id="' + eid + '" data-vid="' + esc(x.id) + '" aria-label="' + esc(x.name) + 'を編集">' + ICON.pencil + '</button>' +
+          '<a class="btn-buy calm" ' + buyAttrs(e, x) + '>購入する</a></div>';
+      }).join('') + '</div></section>' : '';
     return '<div class="wrap"><a class="back" href="#home">' + ICON.back + 'そろそろ買う</a><div class="detail"><div class="dcol">' +
-      '<section class="card"><div class="d-head"><div class="thumb lg" style="background:' + tintOf(it) + '">' + thumb(it) + '</div>' +
-      '<div class="d-title"><h1>' + esc(it.name) + '</h1><span class="tag ' + s.level + '">' + s.label + '</span></div></div>' +
+      '<section class="card"><div class="d-head"><div class="thumb lg" style="background:' + tintOf(v.id) + '">' + thumbInner(v, e.category) + '</div>' +
+      '<div class="d-title">' + (multi(e) ? '<span class="eyebrow">' + esc(e.name) + '</span>' : '') + '<h1>' + esc(v.name) + '</h1><span class="tag ' + s.level + '">' + s.label + '</span></div></div>' +
       '<div class="seg2" role="group" aria-label="種類">' +
-      '<button data-action="setMust" data-id="' + eid + '" data-v="1" class="' + (it.must ? 'on' : '') + '" aria-pressed="' + it.must + '">' + ICON.star + '必ず買う（通知あり）</button>' +
-      '<button data-action="setMust" data-id="' + eid + '" data-v="0" class="' + (!it.must ? 'on' : '') + '" aria-pressed="' + !it.must + '">たまに買う（通知なし）</button></div>' +
-      '<dl class="info"><dt>サイト</dt><dd>' + siteLabel(it) + '</dd>' +
-      '<dt>リンク</dt><dd class="trunc">' + (it.url ? esc(it.url) : '<span class="muted">未登録</span>') + '</dd>' +
-      '<dt>カテゴリー</dt><dd>' + esc(it.category) + '</dd>' +
+      '<button data-action="setMust" data-id="' + eid + '" data-v="1" class="' + (e.must ? 'on' : '') + '" aria-pressed="' + e.must + '">' + ICON.star + '必ず買う（通知あり）</button>' +
+      '<button data-action="setMust" data-id="' + eid + '" data-v="0" class="' + (!e.must ? 'on' : '') + '" aria-pressed="' + !e.must + '">たまに買う（通知なし）</button></div>' +
+      '<dl class="info"><dt>サイト</dt><dd>' + siteLabel(v) + '</dd>' +
+      '<dt>リンク</dt><dd class="trunc">' + (v.url ? esc(v.url) : '<span class="muted">未登録</span>') + '</dd>' +
+      '<dt>カテゴリー</dt><dd>' + esc(e.category) + '</dd>' +
+      '<dt>購入回数</dt><dd><b>' + e.history.length + '回</b></dd>' +
       '<dt>前回価格</dt><dd><b>' + yen(lp) + '</b>' + diff + '</dd>' +
       '<dt>前回購入</dt><dd>' + (s.last ? fmtLong(s.last) : '—') + '</dd>' +
-      (it.must && !s.never ? '<dt>次の買いどき</dt><dd><b>' + fmtLong(s.due) + '</b></dd>' : '') + '</dl>' +
-      '<button class="btn-ghost" data-action="edit" data-id="' + eid + '">' + ICON.pencil + '編集する</button></section>' +
-      (it.must ? '<section class="card"><h2>周期と通知</h2><div class="steps">' +
-        '<div class="step"><span>買う周期</span><div class="stepper"><button data-action="cycle" data-d="-1" data-id="' + eid + '" aria-label="1日減らす">−</button><b>' + it.cycle + '日ごと</b><button data-action="cycle" data-d="1" data-id="' + eid + '" aria-label="1日増やす">＋</button></div></div>' +
+      (e.must && !s.never && s.level !== 'stale' ? '<dt>次の買いどき</dt><dd><b>' + fmtLong(s.due) + '</b></dd>' : '') + '</dl>' +
+      (s.level === 'stale' ? '<p class="note stale-note">しばらく買っていないため、通知を止めています。また買うと元に戻ります。</p>' : '') +
+      (!v.image ? '<p class="note">写真は、Chromeで商品写真を長押し→「画像を共有」→「リピ買い」で付けられます。</p>' : '') +
+      '<div class="btn-row"><button class="btn-ghost" data-action="edit" data-id="' + eid + '" data-vid="' + vid + '">' + ICON.pencil + '編集する</button>' +
+      '<button class="btn-ghost" data-action="addBrand" data-id="' + eid + '">' + ICON.plus + '銘柄を追加</button></div></section>' +
+      brands +
+      (e.must ? '<section class="card"><h2>周期と通知</h2><div class="steps">' +
+        '<div class="step"><span>買う周期</span><div class="stepper"><button data-action="cycle" data-d="-1" data-id="' + eid + '" aria-label="1日減らす">−</button><b>' + e.cycle + '日ごと</b><button data-action="cycle" data-d="1" data-id="' + eid + '" aria-label="1日増やす">＋</button></div>' +
+        '</div>' +
         '<div class="step"><span>通知のタイミング</span><div class="stepper"><button data-action="notify" data-d="-1" data-id="' + eid + '" aria-label="1日減らす">−</button><b>' + nb + '</b><button data-action="notify" data-d="1" data-id="' + eid + '" aria-label="1日増やす">＋</button></div></div>' +
-        '</div>' + suggest + '</section>' : '') +
-      '<div class="d-actions"><a class="btn-primary big" ' + buyAttrs(it) + ' data-action="buy" data-id="' + eid + '">' + buyLabel(it) + ICON.ext + '</a>' +
-      (it.must && !s.never ? '<button class="btn-ghost big" data-action="snooze" data-id="' + eid + '">まだある</button>' : '') + '</div></div>' +
+        '</div><div class="step chips-step"><span>よく使う周期</span>' + cycleChips('setCycle', e.cycle, eid) + '</div>' + suggestHtml + '</section>' : '') +
+      '<div class="d-actions"><a class="btn-primary big" ' + buyAttrs(e, v) + '>' + buyLabel(v) + ICON.ext + '</a>' +
+      (e.must && !s.never ? '<button class="btn-ghost big" data-action="snooze" data-id="' + eid + '">まだある</button>' : '') + '</div></div>' +
       '<section class="card hist"><div class="hist-h"><h2>購入履歴</h2><span class="count-pill">全' + hs.length + '回</span>' +
       '<button class="btn-ghost sm" data-action="addHist" data-id="' + eid + '">' + ICON.plus + '手動で追加</button></div>' +
       (hs.length ? rows : '<p class="muted pad">まだ記録がありません</p>') + '</section></div></div>';
@@ -360,10 +506,10 @@
     if (orphan.length) groups.push({ c: '未分類', items: orphan });
     var body = groups.length ? groups.map(function (g) {
       return '<section class="group"><div class="col-h">' + esc(g.c) + '<span class="cnt">' + g.items.length + '</span></div><div class="glist">' +
-        g.items.map(function (it) {
-          var s = status(it);
-          return '<a class="grow" href="#item-' + esc(it.id) + '"><span class="thumb sm" style="background:' + tintOf(it) + '">' + thumb(it) + '</span>' +
-            '<span class="g-name">' + esc(it.name) + '<small>' + siteLabel(it) + ' ・ ' + (it.must ? it.cycle + '日ごと' : 'たまに買う') + '</small></span>' +
+        g.items.map(function (e) {
+          var s = status(e), v = curVariant(e);
+          return '<a class="grow" href="#item-' + esc(e.id) + '"><span class="thumb sm" style="background:' + tintOf(v.id) + '">' + thumbInner(v, e.category) + '</span>' +
+            '<span class="g-name">' + esc(v.name) + '<small>' + (multi(e) ? esc(e.name) + '（銘柄' + e.variants.length + '）・ ' : '') + siteLabel(v) + ' ・ ' + (e.must ? e.cycle + '日ごと' : 'たまに買う') + ' ・ 購入' + e.history.length + '回</small></span>' +
             '<span class="tag ' + s.level + '">' + s.label + '</span></a>';
         }).join('') + '</div></section>';
     }).join('') : emptyState();
@@ -374,7 +520,7 @@
   /* ---------- 購入履歴 ---------- */
   function viewHistory() {
     var all = [];
-    state.items.forEach(function (it) { it.history.forEach(function (h) { all.push({ it: it, h: h }); }); });
+    state.items.forEach(function (e) { e.history.forEach(function (h) { all.push({ e: e, h: h }); }); });
     all.sort(function (a, b) { return b.h.date.localeCompare(a.h.date) || String(b.h.t).localeCompare(String(a.h.t)); });
     var months = [], map = {};
     all.forEach(function (x) {
@@ -389,10 +535,11 @@
       var sum = arr.reduce(function (t, x) { return t + (Number(x.h.price) || 0); }, 0);
       html += '<section class="month"><div class="col-h">' + p[0] + '年' + Number(p[1]) + '月<span class="cnt">' + arr.length + '回 ・ ' + yen(sum) + '</span></div>' +
         arr.map(function (x) {
+          var v = getVariant(x.e, x.h.variantId) || curVariant(x.e);
           return '<div class="hrow"><div class="hdate"><b>' + fmtMDW(x.h.date) + '</b></div>' +
-            '<a class="h-item" href="#item-' + esc(x.it.id) + '">' + esc(x.it.name) + '<small>' + siteLabel(x.it) + '</small></a>' +
+            '<a class="h-item" href="#item-' + esc(x.e.id) + '">' + esc(v.name) + '<small>' + siteLabel(v) + '</small></a>' +
             '<span class="hprice">' + yen(x.h.price) + '</span><span class="hsrc">' + (x.h.source === 'app' ? 'アプリから' : '手動') + '</span>' +
-            '<button class="icon-btn sm" data-action="editHist" data-id="' + esc(x.it.id) + '" data-hid="' + esc(x.h.id) + '" aria-label="この履歴を編集">' + ICON.pencil + '</button></div>';
+            '<button class="icon-btn sm" data-action="editHist" data-id="' + esc(x.e.id) + '" data-hid="' + esc(x.h.id) + '" aria-label="この履歴を編集">' + ICON.pencil + '</button></div>';
         }).join('') + '</section>';
     });
     return html + '</div>';
@@ -416,6 +563,13 @@
       for (var h = 0; h < 24; h++) o += '<option value="' + h + '"' + (h === sel ? ' selected' : '') + '>' + h + ':00</option>';
       return o;
     }
+    var modes = [
+      ['ask', '毎回聞く', '商品ページから戻ったときに「買えましたか？」と聞きます'],
+      ['auto', '自動で購入にする', '「購入する」を押した時点で購入として記録します。違ったら履歴から消せます'],
+      ['none', '記録しない', '自動では記録しません。買ったら商品画面の「手動で追加」で記録します']
+    ].map(function (m) {
+      return '<label class="radio-row"><input type="radio" name="confirmMode" value="' + m[0] + '"' + (st.confirmMode === m[0] ? ' checked' : '') + '><span><b>' + m[1] + '</b><small>' + m[2] + '</small></span></label>';
+    }).join('');
     var cats = state.categories.map(function (c) {
       var n = state.items.filter(function (i) { return i.category === c; }).length;
       return '<div class="cat-row"><span class="cat-name">' + esc(c) + '</span><span class="muted">' + n + '件</span>' +
@@ -427,29 +581,30 @@
       '<div class="set-actions">' + (on
         ? '<button class="btn-ghost" data-action="testNotify">テスト通知を送る</button><button class="btn-ghost" data-action="disableNotify">通知をオフにする</button>'
         : '<button class="btn-primary" data-action="enableNotify">通知をオンにする</button>') + '</div>' +
-      '<p class="note">「必ず買う」商品だけが通知の対象です。通知の時刻はChromeが決めるため前後しますが、下の時間帯には届きません。</p></section>' +
+      '<p class="note">「必ず買う」商品だけが通知の対象です。通知の時刻はChromeが決めるため前後しますが、下の時間帯には届きません。周期の2倍を過ぎ、かつ' + C.STALE_MIN_DAYS + '日以上買っていない商品は「最近買っていない」に移り、通知を止めます。</p></section>' +
       '<section class="card set"><h2>通知しない時間帯</h2><div class="quiet"><select id="qs" aria-label="開始時刻">' + hours(st.quietStart) + '</select><span>から</span>' +
       '<select id="qe" aria-label="終了時刻">' + hours(st.quietEnd) + '</select><span>まで</span></div></section>' +
+      '<section class="card set"><h2>購入の記録のしかた</h2><div class="radios">' + modes + '</div></section>' +
+      '<section class="card set"><h2>共有から登録する</h2>' + shareHowTo() +
+      '<p class="note">「リピ買い」が共有先に出ないときは、ホーム画面に追加してあるか確認してください。追加してあっても出ないときは、ホーム画面のアイコンを一度削除して、もう一度追加してください。</p></section>' +
       '<section class="card set"><h2>カテゴリー</h2><div class="cat-list">' + cats + '</div>' +
-      '<form id="cat-form" class="cat-add"><input name="cat" maxlength="20" placeholder="新しいカテゴリー名" aria-label="新しいカテゴリー名"><button class="btn-ghost" type="submit">追加</button></form></section>' +
+      '<form id="cat-form" class="cat-add"><input id="cat-new" name="cat" maxlength="20" placeholder="新しいカテゴリー名" aria-label="新しいカテゴリー名"><button class="btn-ghost" type="submit">追加</button></form></section>' +
       '<section class="card set"><h2>バックアップ</h2><p class="note">データはこの端末の中だけに保存されています。機種変更やブラウザのデータ削除に備えて、ときどきファイルに書き出してください。iPhoneで見たいときも、このファイルを読み込めば同じ内容を表示できます。</p>' +
       '<div class="set-actions"><button class="btn-ghost" data-action="export">ファイルに書き出す</button>' +
       '<label class="btn-ghost as-btn">ファイルから読み込む<input type="file" id="import-file" accept="application/json,.json" hidden></label></div></section>' +
-      (deferredInstall ? '<section class="card set"><h2>ホーム画面に追加</h2><p class="note">アプリのように起動でき、通知も届きやすくなります。</p><button class="btn-primary" data-action="install">ホーム画面に追加する</button></section>' : '') +
+      (deferredInstall ? '<section class="card set"><h2>ホーム画面に追加</h2><p class="note">アプリのように起動でき、共有からの登録や通知も使えるようになります。</p><button class="btn-primary" data-action="install">ホーム画面に追加する</button></section>' : '') +
       '<p class="ver">リピ買い ver ' + APP_VERSION + '</p></div>';
   }
 
   /* ---------- モーダル ---------- */
-  var pendingConfirm = null;
   function openModal(html) { modalRoot.innerHTML = '<div class="modal-backdrop">' + html + '</div>'; }
+  function closeModal() { modalRoot.innerHTML = ''; }
   function askConfirm(msg, okLabel, onOk) {
     pendingConfirm = onOk;
     openModal('<div class="dialog confirm" role="alertdialog" aria-label="確認"><p class="confirm-msg">' + esc(msg) + '</p>' +
       '<div class="sheet-actions"><span class="sp"></span><button type="button" class="btn-ghost" data-action="closeModal">やめる</button>' +
       '<button type="button" class="btn-primary" data-action="confirmOk">' + esc(okLabel) + '</button></div></div>');
   }
-  function closeModal() { modalRoot.innerHTML = ''; }
-
   function openCatPick() {
     var opts = ['__all'].concat(state.categories).map(function (c) {
       var on = (c === '__all' && !ui.cat) || c === ui.cat;
@@ -457,103 +612,175 @@
     }).join('');
     openModal('<div class="dialog"><h2>カテゴリーで絞り込む</h2><div class="pick">' + opts + '</div></div>');
   }
+  function openBrands(eid) {
+    var e = getItem(eid);
+    if (!e) return;
+    var cur = curVariant(e);
+    openModal('<div class="dialog"><h2>' + esc(e.name || '銘柄') + 'の銘柄</h2><div class="vlist">' + e.variants.map(function (x) {
+      return '<div class="vrow' + (x.id === cur.id ? ' cur' : '') + '"><span class="thumb sm" style="background:' + tintOf(x.id) + '">' + thumbInner(x, e.category) + '</span>' +
+        '<span class="g-name">' + esc(x.name) + '<small>' + siteLabel(x) + ' ・ 購入' + vCount(e, x) + '回 ・ ' + yen(vLastPrice(e, x)) + (x.id === cur.id ? ' ・ 前回買った銘柄' : '') + '</small></span>' +
+        '<a class="btn-buy ' + (x.id === cur.id ? 'hot' : 'calm') + '" ' + buyAttrs(e, x) + '>購入する</a></div>';
+    }).join('') + '</div><div class="sheet-actions"><span class="sp"></span><button class="btn-ghost" data-action="closeModal">閉じる</button></div></div>');
+  }
 
-  function openItemForm(id) {
-    var it = id ? getItem(id) : null;
-    form = { photo: undefined };
-    var v = it || { name: '', url: '', site: 'amazon', category: state.categories[0], must: true, cycle: 7, notifyBefore: 1, image: null };
-    var lp = it ? lastPrice(it) : null;
+  /* 商品の登録・編集フォーム。opts: { id, vid, groupId, prefill, fromShare } */
+  function openItemForm(opts) {
+    opts = opts || {};
+    var e = opts.id ? getItem(opts.id) : null;
+    var v = e ? (opts.vid ? getVariant(e, opts.vid) : curVariant(e)) : null;
+    if (opts.id && (!e || !v)) return;
+    var isNew = !e;
+    var group = isNew && opts.groupId ? getItem(opts.groupId) : null;
+    var pre = opts.prefill || {};
+    form = { photo: pre.image !== undefined ? pre.image : undefined, fromShare: !!opts.fromShare };
+    var vals = {
+      name: v ? v.name : (pre.name || ''),
+      url: v ? v.url : (pre.url || ''),
+      site: v ? v.site : (pre.site || 'amazon'),
+      price: v ? vLastPrice(e, v) : null,
+      image: v ? v.image : (pre.image || null),
+      category: e ? e.category : (group ? group.category : state.categories[0]),
+      must: e ? e.must : true,
+      cycle: e ? e.cycle : 30,
+      notifyBefore: e ? e.notifyBefore : 1,
+      gname: e ? e.name : (group ? group.name : '')
+    };
+    if (form.photo === undefined && isNew) form.photo = null;
+    var showImg = form.photo !== undefined ? form.photo : vals.image;
     var sites = SITE_KEYS.map(function (k) {
-      return '<label><input type="radio" name="site" value="' + k + '"' + (v.site === k ? ' checked' : '') + '><span>' + SITES[k] + '</span></label>';
+      return '<label><input type="radio" name="site" value="' + k + '"' + (vals.site === k ? ' checked' : '') + '><span>' + SITES[k] + '</span></label>';
     }).join('');
     var cats = state.categories.map(function (c) {
-      return '<option' + (c === v.category ? ' selected' : '') + '>' + esc(c) + '</option>';
+      return '<option' + (c === vals.category ? ' selected' : '') + '>' + esc(c) + '</option>';
     }).join('');
-    openModal('<form class="dialog sheet" id="item-form" data-id="' + (it ? esc(it.id) : '') + '" novalidate>' +
-      '<h2>' + (it ? '商品を編集' : '商品を登録') + '</h2>' +
-      '<label class="field"><span>商品名</span><input name="name" maxlength="60" value="' + esc(v.name) + '" placeholder="例：ミネラルウォーター 2L×6本"></label>' +
-      '<label class="field"><span>商品ページのリンク</span><input name="url" type="url" inputmode="url" value="' + esc(v.url) + '" placeholder="https://"><small>商品ページのURLを貼り付けると、サイトを自動で選びます</small></label>' +
+    var groupSel = '';
+    if (isNew && state.items.length) {
+      groupSel = '<label class="field"><span>まとめ方</span><select name="group" id="f-group">' +
+        '<option value="">新しい商品として登録する</option>' +
+        state.items.map(function (x) {
+          return '<option value="' + esc(x.id) + '"' + (group && group.id === x.id ? ' selected' : '') + '>「' + esc(entryLabel(x)) + '」の別の銘柄として追加</option>';
+        }).join('') + '</select><small>同じ種類の商品（例：ミネラルウォーターのいろはすと天然水）をまとめると、周期と購入回数を合わせて数えます</small></label>';
+    }
+    var showGname = !!group || (!isNew && multi(e));
+    var title = isNew ? (group ? '銘柄を追加' : '商品を登録') : '商品を編集';
+    openModal('<form class="dialog sheet" id="item-form" data-id="' + (e ? esc(e.id) : '') + '" data-vid="' + (v ? esc(v.id) : '') + '" novalidate>' +
+      '<h2>' + title + '</h2>' + (form.fromShare ? '<p class="from-share">' + ICON.share + '共有から受け取りました。内容を確認して保存してください</p>' : '') +
+      groupSel +
+      '<label class="field gname-field"' + (showGname ? '' : ' hidden') + '><span>品目名（まとめた商品の呼び名）</span><input id="f-gname" name="gname" maxlength="30" value="' + esc(vals.gname) + '" placeholder="例：ミネラルウォーター"></label>' +
+      '<label class="field"><span>商品名</span><input id="f-name" name="name" maxlength="60" value="' + esc(vals.name) + '" placeholder="例：い・ろ・は・す 540ml×24本"></label>' +
+      '<label class="field"><span>商品ページのリンク</span><input id="f-url" name="url" type="url" inputmode="url" value="' + esc(vals.url) + '" placeholder="https://"><small>商品ページのURLを貼り付けると、サイトを自動で選びます</small></label>' +
       '<div class="field"><span>サイト</span><div class="seg">' + sites + '</div></div>' +
-      '<label class="field"><span>カテゴリー</span><select name="category">' + cats + '</select></label>' +
-      '<div class="field"><span>種類</span><div class="seg"><label><input type="radio" name="must" value="1"' + (v.must ? ' checked' : '') + '><span>必ず買う（通知あり）</span></label>' +
-      '<label><input type="radio" name="must" value="0"' + (!v.must ? ' checked' : '') + '><span>たまに買う（通知なし）</span></label></div></div>' +
-      '<div class="field-row"><label class="field"><span>買う周期（日ごと）</span><input name="cycle" type="number" min="1" max="365" inputmode="numeric" value="' + v.cycle + '"></label>' +
-      '<label class="field"><span>何日前に通知</span><input name="notifyBefore" type="number" min="0" max="30" inputmode="numeric" value="' + v.notifyBefore + '"></label></div>' +
-      '<div class="field-row"><label class="field"><span>' + (it ? '前回価格（円）' : '価格（円・任意）') + '</span><input name="price" type="number" min="0" inputmode="numeric" value="' + (lp == null ? '' : lp) + '"></label>' +
-      (it ? '' : '<label class="field"><span>前回買った日（任意）</span><input name="lastDate" type="date" max="' + C.todayStr() + '"></label>') + '</div>' +
-      '<div class="field"><span>写真（任意）</span><div class="photo-row"><div class="thumb" id="photo-prev" style="background:var(--tint1)">' + (v.image ? '<img src="' + esc(v.image) + '" alt="">' : IL[kindOf(v.category)]) + '</div>' +
-      '<label class="btn-ghost as-btn">写真を選ぶ<input type="file" id="photo-file" accept="image/*" hidden></label>' +
-      (v.image ? '<button type="button" class="link-btn" data-action="clearPhoto">写真を外す</button>' : '') + '</div></div>' +
+      '<div class="entry-fields"' + (group ? ' hidden' : '') + '>' +
+      '<label class="field"><span>カテゴリー</span><select id="f-cat" name="category">' + cats + '</select></label>' +
+      '<div class="field"><span>種類</span><div class="seg"><label><input type="radio" name="must" value="1"' + (vals.must ? ' checked' : '') + '><span>必ず買う（通知あり）</span></label>' +
+      '<label><input type="radio" name="must" value="0"' + (!vals.must ? ' checked' : '') + '><span>たまに買う（通知なし）</span></label></div></div>' +
+      '<div class="field"><span>買う周期（日数で入力。1か月なら30）</span><div class="cycle-in"><input id="f-cycle" name="cycle" type="number" min="1" max="365" inputmode="numeric" value="' + vals.cycle + '"><span class="unit">日ごと</span></div>' + cycleChips('formCycle', vals.cycle) + '</div>' +
+      '<label class="field"><span>何日前に通知</span><input id="f-nb" name="notifyBefore" type="number" min="0" max="30" inputmode="numeric" value="' + vals.notifyBefore + '"></label>' +
+      '</div>' +
+      '<div class="field-row"><label class="field"><span>' + (isNew ? '価格（円・任意）' : '前回価格（円）') + '</span><input id="f-price" name="price" type="number" min="0" inputmode="numeric" value="' + (vals.price == null ? '' : vals.price) + '"></label>' +
+      (isNew ? '<label class="field"><span>前回買った日（任意）</span><input id="f-last" name="lastDate" type="date" max="' + C.todayStr() + '"></label>' : '') + '</div>' +
+      '<div class="field"><span>写真</span><div class="photo-row"><div class="thumb" id="photo-prev" style="background:var(--tint1)">' + (showImg ? '<img src="' + esc(showImg) + '" alt="">' : IL[kindOf(vals.category)]) + '</div>' +
+      (showImg ? '<button type="button" class="link-btn" data-action="clearPhoto">写真を外す</button>' : '<small class="photo-note">保存したあと、Chromeで商品写真を長押し→「画像を共有」→「リピ買い」で付けられます</small>') + '</div></div>' +
       '<p class="form-err" id="form-err" role="alert"></p>' +
-      '<div class="sheet-actions">' + (it ? '<button type="button" class="link-btn danger" data-action="deleteItem" data-id="' + esc(it.id) + '">この商品を削除</button>' : '') +
+      '<div class="sheet-actions">' + (!isNew ? '<button type="button" class="link-btn danger" data-action="deleteItem" data-id="' + esc(e.id) + '" data-vid="' + esc(v.id) + '">' + (multi(e) ? 'この銘柄を削除' : 'この商品を削除') + '</button>' : '') +
       '<span class="sp"></span><button type="button" class="btn-ghost" data-action="closeModal">キャンセル</button><button type="submit" class="btn-primary">保存する</button></div></form>');
   }
 
   function saveItem(f) {
     var fd = new FormData(f);
     var err = f.querySelector('#form-err');
-    var name = String(fd.get('name') || '').trim();
+    var name = String(fd.get('name') || '').trim().slice(0, 60);
     var urlRaw = String(fd.get('url') || '').trim();
     if (!name) { err.textContent = '商品名を入力してください'; return; }
     var url = '';
     if (urlRaw) {
-      url = safeUrl(urlRaw);
+      url = tidyUrl(urlRaw);
       if (!url) { err.textContent = 'リンクは https:// から始まるURLを入力してください'; return; }
     }
-    var cycle = clampInt(fd.get('cycle'), 1, 365, 7);
-    var nb = clampInt(fd.get('notifyBefore'), 0, 30, 1);
+    var site = SITE_KEYS.indexOf(fd.get('site')) >= 0 ? fd.get('site') : 'other';
     var price = numOrNull(fd.get('price'));
-    var id = f.dataset.id;
-    var it = id ? getItem(id) : null;
-    if (!it) {
-      it = { id: uid(), history: [], createdAt: new Date().toISOString(), snoozeUntil: null, image: null, price: price };
+    var gname = String(fd.get('gname') || '').trim().slice(0, 30);
+    var groupId = String(fd.get('group') || '');
+    var e = f.dataset.id ? getItem(f.dataset.id) : null;
+    var v = e && f.dataset.vid ? getVariant(e, f.dataset.vid) : null;
+    var group = !e && groupId ? getItem(groupId) : null;
+    if ((group || (e && multi(e))) && !gname) { err.textContent = '品目名を入力してください（例：ミネラルウォーター）'; return; }
+    var now = new Date().toISOString();
+    var isNew = !e;
+    if (isNew) {
+      v = { id: uid(), name: name, url: url, site: site, image: form.photo || null, price: price, createdAt: now };
+      if (group) {
+        e = group;
+        e.name = gname;
+        e.variants.push(v);
+      } else {
+        e = { id: uid(), name: '', category: state.categories[0], must: true, cycle: 30, notifyBefore: 1, snoozeUntil: null, suggestOff: null, createdAt: now, variants: [v], history: [] };
+        state.items.push(e);
+      }
       var ld = fd.get('lastDate');
-      if (isDate(ld)) it.history.push({ id: uid(), date: ld, t: new Date().toISOString(), price: price, source: 'manual' });
-      state.items.push(it);
+      if (isDate(ld)) { e.history.push({ id: uid(), date: ld, t: now, price: price, source: 'manual', variantId: v.id }); e.snoozeUntil = null; }
     } else {
-      var p = priced(it);
-      if (p.length && price != null) p[0].price = price; else it.price = price;
+      v.name = name; v.url = url; v.site = site;
+      if (form.photo !== undefined) v.image = form.photo;
+      var p = vPriced(e, v);
+      if (p.length && price != null) p[0].price = price; else v.price = price;
+      if (multi(e)) e.name = gname;
     }
-    it.name = name;
-    it.url = url;
-    it.site = SITE_KEYS.indexOf(fd.get('site')) >= 0 ? fd.get('site') : 'other';
-    it.category = fd.get('category') || state.categories[0];
-    it.must = fd.get('must') !== '0';
-    it.cycle = cycle;
-    it.notifyBefore = nb;
-    if (form.photo !== undefined) it.image = form.photo;
+    if (!group) {
+      e.category = fd.get('category') || e.category;
+      e.must = fd.get('must') !== '0';
+      e.cycle = clampInt(fd.get('cycle'), 1, 365, e.cycle);
+      e.notifyBefore = Math.min(clampInt(fd.get('notifyBefore'), 0, 30, 1), e.cycle);
+    }
+    var fromShare = form.fromShare;
+    if (isNew && fromShare) state.lastShared = { itemId: e.id, variantId: v.id, at: Date.now() };
     persist();
     closeModal();
-    toast(id ? '保存しました' : '登録しました');
-    if (!id) location.hash = '#item-' + it.id; else render();
+    toast(isNew ? '登録しました' : '保存しました');
+    location.hash = '#item-' + e.id;
+    render();
+    if (isNew && fromShare && !v.image) showPhotoGuide(v);
+  }
+  function showPhotoGuide(v) {
+    openModal('<div class="dialog guide"><div class="guide-icon">' + ICON.photo + '</div><h2>続けて商品写真を共有してください</h2>' +
+      '<p class="muted">「' + esc(v.name) + '」に写真を付けます</p>' +
+      '<ol class="howto"><li>Chromeに戻り、商品ページの写真を<b>長押し</b>する</li><li>「<b>画像を共有</b>」を選ぶ</li><li>共有先から「<b>リピ買い</b>」を選ぶ</li></ol>' +
+      '<p class="note">30分以内に共有すると、この商品に自動で付きます。写真はあとからでも付けられます。</p>' +
+      '<div class="sheet-actions"><span class="sp"></span><button class="btn-primary" data-action="closeModal">わかりました</button></div></div>');
   }
 
-  function openHistForm(itemId, hid) {
-    var it = getItem(itemId);
-    if (!it) return;
-    var h = hid ? it.history.find(function (x) { return x.id === hid; }) : null;
-    var price = h ? h.price : lastPrice(it);
-    openModal('<form class="dialog" id="hist-form" data-id="' + esc(it.id) + '" data-hid="' + (h ? esc(h.id) : '') + '">' +
-      '<h2>' + (h ? '購入履歴を編集' : '購入を手動で追加') + '</h2><p class="muted">' + esc(it.name) + '</p>' +
-      '<label class="field"><span>購入日</span><input type="date" name="date" required max="' + C.todayStr() + '" value="' + (h ? h.date : C.todayStr()) + '"></label>' +
-      '<label class="field"><span>価格（円・任意）</span><input type="number" name="price" min="0" inputmode="numeric" value="' + (price == null ? '' : price) + '"></label>' +
-      '<div class="sheet-actions">' + (h ? '<button type="button" class="link-btn danger" data-action="deleteHist" data-id="' + esc(it.id) + '" data-hid="' + esc(h.id) + '">この記録を削除</button>' : '') +
+  function openHistForm(eid, hid) {
+    var e = getItem(eid);
+    if (!e) return;
+    var h = hid ? e.history.find(function (x) { return x.id === hid; }) : null;
+    var v = h ? (getVariant(e, h.variantId) || curVariant(e)) : curVariant(e);
+    var price = h ? h.price : vLastPrice(e, v);
+    var vsel = multi(e) ? '<label class="field"><span>銘柄</span><select id="h-variant" name="variant">' + e.variants.map(function (x) {
+      return '<option value="' + esc(x.id) + '"' + (x.id === v.id ? ' selected' : '') + '>' + esc(x.name) + '（' + siteLabel(x) + '）</option>';
+    }).join('') + '</select></label>' : '';
+    openModal('<form class="dialog" id="hist-form" data-id="' + esc(e.id) + '" data-hid="' + (h ? esc(h.id) : '') + '">' +
+      '<h2>' + (h ? '購入履歴を編集' : '購入を手動で追加') + '</h2><p class="muted">' + esc(entryLabel(e)) + '</p>' + vsel +
+      '<label class="field"><span>購入日</span><input id="h-date" type="date" name="date" required max="' + C.todayStr() + '" value="' + (h ? h.date : C.todayStr()) + '"></label>' +
+      '<label class="field"><span>価格（円・任意）</span><input id="h-price" type="number" name="price" min="0" inputmode="numeric" value="' + (price == null ? '' : price) + '"></label>' +
+      '<div class="sheet-actions">' + (h ? '<button type="button" class="link-btn danger" data-action="deleteHist" data-id="' + esc(e.id) + '" data-hid="' + esc(h.id) + '">この記録を削除</button>' : '') +
       '<span class="sp"></span><button type="button" class="btn-ghost" data-action="closeModal">キャンセル</button><button type="submit" class="btn-primary">保存する</button></div></form>');
   }
   function saveHist(f) {
-    var it = getItem(f.dataset.id);
-    if (!it) return;
+    var e = getItem(f.dataset.id);
+    if (!e) return;
     var fd = new FormData(f);
     var date = fd.get('date');
     if (!isDate(date)) return;
     var price = numOrNull(fd.get('price'));
+    var vid = fd.get('variant');
+    if (!getVariant(e, vid)) vid = curVariant(e).id;
     var hid = f.dataset.hid;
     if (hid) {
-      var h = it.history.find(function (x) { return x.id === hid; });
-      if (h) { h.date = date; h.price = price; }
+      var h = e.history.find(function (x) { return x.id === hid; });
+      if (h) { h.date = date; h.price = price; h.variantId = vid; }
     } else {
-      it.history.push({ id: uid(), date: date, t: new Date().toISOString(), price: price, source: 'manual' });
-      it.snoozeUntil = null;
+      e.history.push({ id: uid(), date: date, t: new Date().toISOString(), price: price, source: 'manual', variantId: vid });
+      e.snoozeUntil = null;
     }
     persist();
     closeModal();
@@ -562,15 +789,21 @@
   }
 
   /* ---------- 購入・確認 ---------- */
-  function buy(id) {
-    var it = getItem(id);
-    if (!it) return;
-    var h = { id: uid(), date: C.todayStr(), t: new Date().toISOString(), price: lastPrice(it), source: 'app' };
-    it.history.push(h);
-    it.snoozeUntil = null;
-    state.pending = { itemId: it.id, histId: h.id, at: Date.now() };
+  function buy(eid, vid) {
+    var e = getItem(eid);
+    if (!e) return;
+    var v = getVariant(e, vid) || curVariant(e);
+    var mode = state.settings.confirmMode;
+    if (mode === 'none') return;
+    var h = { id: uid(), date: C.todayStr(), t: new Date().toISOString(), price: vLastPrice(e, v), source: 'app', variantId: v.id };
+    e.history.push(h);
+    e.snoozeUntil = null;
+    delete state.notified[e.id];
+    if (mode === 'ask') state.pending.push({ itemId: e.id, histId: h.id, at: Date.now() });
     persist();
+    if (modalRoot.querySelector('.vlist')) closeModal();
     render();
+    if (mode === 'auto') { toast('購入として記録しました（違ったら履歴から消せます）'); return; }
     var wentAway = false;
     function onHide() { if (document.visibilityState === 'hidden') wentAway = true; }
     document.addEventListener('visibilitychange', onHide);
@@ -580,58 +813,137 @@
       if (!wentAway && document.visibilityState === 'visible') showReturn();
     }, 2500);
   }
-  function checkPending() {
-    var p = state.pending;
-    if (!p) return;
-    if (Date.now() - p.at > 12 * 3600 * 1000) { state.pending = null; persist(); return; }
-    showReturn();
-  }
+  /* 確認待ちを先頭から1つずつ聞く（確認漏れが出ないよう、答えるまで残す） */
   function showReturn() {
-    var p = state.pending;
-    if (!p || modalRoot.querySelector('.ret')) return;
-    var it = getItem(p.itemId);
-    var h = it && it.history.find(function (x) { return x.id === p.histId; });
-    if (!it || !h) { state.pending = null; persist(); return; }
-    var from = it.site === 'other' ? 'お店' : siteLabel(it);
+    if (!state.pending.length || modalRoot.querySelector('.ret') || modalRoot.querySelector('#item-form') || modalRoot.querySelector('.attach')) return;
+    var p = state.pending[0];
+    var e = getItem(p.itemId);
+    var h = e && e.history.find(function (x) { return x.id === p.histId; });
+    if (!e || !h) { state.pending.shift(); persist(); showReturn(); return; }
+    var v = getVariant(e, h.variantId) || curVariant(e);
+    var from = v.site === 'other' ? 'お店' : siteLabel(v);
+    var n = state.pending.length;
     openModal('<div class="dialog ret" role="dialog" aria-label="購入の確認"><div class="ret-icon">' + ICON.cart + '</div>' +
+      (n > 1 ? '<span class="ret-count">確認が ' + n + '件 あります</span>' : '') +
       '<span class="ret-from">' + esc(from) + 'から おかえりなさい</span>' +
-      '<div class="ret-name">' + esc(it.name) + '</div><div class="ret-q">買えましたか？</div>' +
+      '<div class="ret-name">' + esc(v.name) + '</div><div class="ret-q">買えましたか？</div>' +
       '<div class="ret-price"><label for="ret-price">今回の価格</label><div class="yen"><span>¥</span><input id="ret-price" type="number" min="0" inputmode="numeric" value="' + (h.price == null ? '' : h.price) + '"></div><span class="muted">任意</span></div>' +
-      (it.must ? '<div class="ret-next">' + ICON.bell + '<span>「はい」で次の買いどきは <b>' + fmtLong(C.addDays(h.date, it.cycle)) + '</b></span></div>' : '') +
+      (e.must ? '<div class="ret-next">' + ICON.bell + '<span>「はい」で次の買いどきは <b>' + fmtLong(C.addDays(h.date, e.cycle)) + '</b></span></div>' : '') +
       '<div class="ret-actions"><button class="btn-primary big" data-action="retYes">はい、買った</button><button class="btn-ghost big" data-action="retNo">いいえ、まだ</button></div>' +
       '<p class="ret-note">あとから購入履歴で直せます</p></div>');
   }
   function retAnswer(yes) {
-    var p = state.pending;
+    var p = state.pending.shift();
     if (p) {
-      var it = getItem(p.itemId);
-      if (it) {
+      var e = getItem(p.itemId);
+      if (e) {
         if (yes) {
-          var h = it.history.find(function (x) { return x.id === p.histId; });
+          var h = e.history.find(function (x) { return x.id === p.histId; });
           var el = document.getElementById('ret-price');
           if (h && el) h.price = numOrNull(el.value);
-          delete state.notified[it.id];
         } else {
-          it.history = it.history.filter(function (x) { return x.id !== p.histId; });
+          e.history = e.history.filter(function (x) { return x.id !== p.histId; });
         }
       }
-      state.pending = null;
       persist();
     }
     closeModal();
     render();
     toast(yes ? '購入を記録しました' : '記録を取り消しました');
+    if (state.pending.length) setTimeout(showReturn, 350);
   }
   function snooze(id) {
-    var it = getItem(id);
-    if (!it) return;
-    var s = status(it), today = C.todayStr();
+    var e = getItem(id);
+    if (!e) return;
+    var s = status(e), today = C.todayStr();
     var base = s.due > today ? s.due : today;
-    it.snoozeUntil = C.addDays(base, 2);
-    delete state.notified[it.id];
+    e.snoozeUntil = C.addDays(base, 2);
+    delete state.notified[e.id];
     persist();
     render();
-    toast(fmtLong(it.snoozeUntil) + ' にまたお知らせします');
+    toast(fmtLong(e.snoozeUntil) + ' にまたお知らせします');
+  }
+
+  /* ---------- 共有で届いたもの ---------- */
+  async function processInbox() {
+    var box = await DB.getKV('inbox');
+    if (location.hash === '#share') history.replaceState(null, '', location.pathname + location.search + '#home');
+    if (!box) { render(); return; }
+    await DB.setKV('inbox', null);
+    if (Date.now() - (Number(box.at) || 0) > 24 * 3600 * 1000) { render(); return; }
+    var url = findUrl(box.url) || findUrl(box.text) || '';
+    var site = detectSite(url) || 'other';
+    var rawTitle = box.title || String(box.text || '').replace(url, '').trim();
+    var name = cleanTitle(rawTitle, site);
+    var key = urlKey(url);
+    var match = null;
+    if (key) {
+      state.items.some(function (e) {
+        return e.variants.some(function (v) { if (urlKey(v.url) === key) { match = { e: e, v: v }; return true; } return false; });
+      });
+    }
+    render();
+    if (box.image) {
+      try { sharePhoto = await resizeImage(box.image); } catch (err) { toast('写真を読み込めませんでした'); return; }
+      if (match) { confirmAttach(match.e, match.v); return; }
+      if (url) {
+        openItemForm({ fromShare: true, prefill: { name: name, url: tidyUrl(url) || '', site: site, image: sharePhoto } });
+        sharePhoto = null;
+        return;
+      }
+      var ls = state.lastShared;
+      if (ls && Date.now() - ls.at < 30 * 60 * 1000) {
+        var le = getItem(ls.itemId), lv = le && getVariant(le, ls.variantId);
+        if (lv && !lv.image) { confirmAttach(le, lv); return; }
+      }
+      openAttachPick();
+      return;
+    }
+    if (match) {
+      location.hash = '#item-' + match.e.id;
+      toast('「' + match.v.name + '」はもう登録されています');
+      return;
+    }
+    if (!url && !name) { toast('共有された内容を読み取れませんでした'); return; }
+    openItemForm({ fromShare: true, prefill: { name: name, url: tidyUrl(url) || '', site: site } });
+  }
+  function confirmAttach(e, v) {
+    openModal('<div class="dialog attach"><h2>写真を付けますか？</h2><div class="attach-prev"><img src="' + esc(sharePhoto) + '" alt="共有された写真"></div>' +
+      '<p class="confirm-msg">この写真を「<b>' + esc(v.name) + '</b>」に付けます。' + (v.image ? '今の写真と入れ替わります。' : '') + '</p>' +
+      '<div class="sheet-actions"><button type="button" class="link-btn" data-action="attachPick">ほかの商品を選ぶ</button><span class="sp"></span>' +
+      '<button type="button" class="btn-ghost" data-action="attachCancel">やめる</button>' +
+      '<button type="button" class="btn-primary" data-action="attachYes" data-id="' + esc(e.id) + '" data-vid="' + esc(v.id) + '">はい、付ける</button></div></div>');
+  }
+  function openAttachPick() {
+    var list = [];
+    state.items.forEach(function (e) { e.variants.forEach(function (v) { list.push({ e: e, v: v }); }); });
+    if (!list.length) {
+      openItemForm({ fromShare: true, prefill: { image: sharePhoto } });
+      sharePhoto = null;
+      return;
+    }
+    list.sort(function (a, b) {
+      if (!a.v.image !== !b.v.image) return a.v.image ? 1 : -1;
+      return String(b.v.createdAt).localeCompare(String(a.v.createdAt));
+    });
+    openModal('<div class="dialog attach"><h2>どの商品の写真にしますか？</h2><div class="attach-prev sm"><img src="' + esc(sharePhoto) + '" alt="共有された写真"></div>' +
+      '<div class="vlist pick-list">' + list.map(function (x) {
+        return '<button type="button" class="vrow as-pick" data-action="attachYes" data-id="' + esc(x.e.id) + '" data-vid="' + esc(x.v.id) + '"><span class="thumb sm" style="background:' + tintOf(x.v.id) + '">' + thumbInner(x.v, x.e.category) + '</span>' +
+          '<span class="g-name">' + esc(x.v.name) + '<small>' + siteLabel(x.v) + (x.v.image ? ' ・ 写真あり（入れ替え）' : ' ・ 写真なし') + '</small></span></button>';
+      }).join('') + '</div>' +
+      '<div class="sheet-actions"><button type="button" class="link-btn" data-action="attachNew">新しい商品として登録</button><span class="sp"></span><button type="button" class="btn-ghost" data-action="attachCancel">やめる</button></div></div>');
+  }
+  function attachTo(eid, vid) {
+    var e = getItem(eid), v = e && getVariant(e, vid);
+    if (!v || !sharePhoto) { closeModal(); return; }
+    v.image = sharePhoto;
+    sharePhoto = null;
+    state.lastShared = null;
+    persist();
+    closeModal();
+    location.hash = '#item-' + e.id;
+    render();
+    toast('写真を付けました');
   }
 
   /* ---------- 通知 ---------- */
@@ -742,21 +1054,24 @@
   }
   function sample() {
     var t = C.todayStr();
-    function mk(name, site, url, category, cycle, agos, price, must) {
+    function mk(o) {
+      var vs = o.v.map(function (x) { return { id: uid(), name: x[0], site: x[1], url: x[2], image: null, price: null, createdAt: new Date().toISOString() }; });
       return {
-        id: uid(), name: name, site: site, url: url, category: category, must: must !== false, cycle: cycle, notifyBefore: 1,
-        price: null, image: null, snoozeUntil: null, createdAt: new Date().toISOString(),
-        history: agos.map(function (a) { return { id: uid(), date: C.addDays(t, -a), t: '', price: price, source: 'app' }; })
+        id: uid(), name: o.name || '', category: o.cat, must: o.must !== false, cycle: o.cycle, notifyBefore: 1,
+        snoozeUntil: null, suggestOff: null, createdAt: new Date().toISOString(), variants: vs,
+        history: o.h.map(function (x) { return { id: uid(), date: C.addDays(t, -x[0]), t: '', price: x[2], source: 'app', variantId: vs[x[1]].id }; })
       };
     }
     state.items.push(
-      mk('ミネラルウォーター 2L×6本', 'yodobashi', 'https://www.yodobashi.com/', '飲料', 4, [4, 8, 13, 17, 22], 698),
-      mk('トイレットペーパー 12ロール', 'amazon', 'https://www.amazon.co.jp/', '紙類', 28, [29, 57], 1078),
-      mk('食器用洗剤 詰め替え', 'rakuten', 'https://www.rakuten.co.jp/', '洗剤・掃除', 30, [28, 58], 498),
-      mk('炭酸水 500ml×24本', 'amazon', 'https://www.amazon.co.jp/', '飲料', 14, [11, 25, 39], 1580),
-      mk('洗濯用洗剤 詰め替え', 'yodobashi', 'https://www.yodobashi.com/', '洗剤・掃除', 29, [20], 658),
-      mk('ティッシュ 5箱', 'amazon', 'https://www.amazon.co.jp/', '紙類', 44, [30], 548),
-      mk('歯ブラシ 4本', 'rakuten', 'https://www.rakuten.co.jp/', '衛生用品', 90, [48], 398, false)
+      mk({ name: 'ミネラルウォーター', cat: '飲料', cycle: 4, v: [['い・ろ・は・す 540ml×24本', 'amazon', 'https://www.amazon.co.jp/'], ['南アルプスの天然水 2L×6本', 'yodobashi', 'https://www.yodobashi.com/']],
+        h: [[5, 1, 698], [10, 0, 1980], [15, 1, 698], [21, 0, 1980], [26, 1, 678]] }),
+      mk({ cat: '紙類', cycle: 28, v: [['トイレットペーパー 12ロール', 'amazon', 'https://www.amazon.co.jp/']], h: [[29, 0, 1078], [57, 0, 1078]] }),
+      mk({ cat: '洗剤・掃除', cycle: 30, v: [['食器用洗剤 詰め替え', 'rakuten', 'https://www.rakuten.co.jp/']], h: [[28, 0, 498], [58, 0, 498]] }),
+      mk({ cat: '飲料', cycle: 14, v: [['炭酸水 500ml×24本', 'amazon', 'https://www.amazon.co.jp/']], h: [[11, 0, 1580], [25, 0, 1580], [39, 0, 1480]] }),
+      mk({ cat: '洗剤・掃除', cycle: 29, v: [['洗濯用洗剤 詰め替え', 'yodobashi', 'https://www.yodobashi.com/']], h: [[20, 0, 658]] }),
+      mk({ cat: '紙類', cycle: 44, v: [['ティッシュ 5箱', 'amazon', 'https://www.amazon.co.jp/']], h: [[30, 0, 548]] }),
+      mk({ cat: '洗剤・掃除', cycle: 10, v: [['柔軟剤 詰め替え', 'rakuten', 'https://www.rakuten.co.jp/']], h: [[35, 0, 598]] }),
+      mk({ cat: '衛生用品', cycle: 90, must: false, v: [['歯ブラシ 4本', 'rakuten', 'https://www.rakuten.co.jp/']], h: [[48, 0, 398]] })
     );
     persist();
     render();
@@ -767,11 +1082,14 @@
       var img = new Image();
       var url = URL.createObjectURL(file);
       img.onload = function () {
-        var sc = Math.min(1, 400 / Math.max(img.width, img.height));
+        var sc = Math.min(1, 480 / Math.max(img.width, img.height));
         var c = document.createElement('canvas');
-        c.width = Math.round(img.width * sc);
-        c.height = Math.round(img.height * sc);
-        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        c.width = Math.max(1, Math.round(img.width * sc));
+        c.height = Math.max(1, Math.round(img.height * sc));
+        var ctx = c.getContext('2d');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.drawImage(img, 0, 0, c.width, c.height);
         URL.revokeObjectURL(url);
         res(c.toDataURL('image/jpeg', 0.82));
       };
@@ -779,124 +1097,6 @@
       img.src = url;
     });
   }
-
-  /* ---------- イベント ---------- */
-  document.addEventListener('click', function (e) {
-    var t = e.target;
-    if (t.classList && t.classList.contains('modal-backdrop')) { closeModal(); return; }
-    if (t.classList && t.classList.contains('drawer-backdrop')) { ui.drawer = false; render(); return; }
-    var el = t.closest && t.closest('[data-action]');
-    if (!el) return;
-    var a = el.dataset.action, id = el.dataset.id, it;
-    switch (a) {
-      case 'drawer': ui.drawer = true; render(); break;
-      case 'closeDrawer': ui.drawer = false; setTimeout(render, 0); break;
-      case 'add': ui.drawer = false; render(); openItemForm(null); break;
-      case 'edit': openItemForm(id); break;
-      case 'buy':
-        if (el.dataset.nolink) { e.preventDefault(); toast('商品ページのリンクが未登録です'); openItemForm(id); }
-        else buy(id);
-        break;
-      case 'confirmOk': { var fn = pendingConfirm; pendingConfirm = null; closeModal(); if (fn) fn(); break; }
-      case 'snooze': snooze(id); break;
-      case 'site': ui.site = el.dataset.site; render(); break;
-      case 'catPick': openCatPick(); break;
-      case 'setCat': ui.cat = el.dataset.cat === '__all' ? null : el.dataset.cat; closeModal(); render(); break;
-      case 'setMust': it = getItem(id); if (it) { it.must = el.dataset.v === '1'; persist(); render(); } break;
-      case 'cycle': it = getItem(id); if (it) { it.cycle = clampInt(it.cycle + Number(el.dataset.d), 1, 365, it.cycle); if (it.notifyBefore > it.cycle) it.notifyBefore = it.cycle; persist(); render(); } break;
-      case 'notify': it = getItem(id); if (it) { it.notifyBefore = clampInt(it.notifyBefore + Number(el.dataset.d), 0, Math.min(30, it.cycle), it.notifyBefore); persist(); render(); } break;
-      case 'applyAvg': it = getItem(id); if (it) { var av = avgInterval(it); if (av) { it.cycle = Math.max(1, Math.round(av)); persist(); render(); toast(it.cycle + '日ごとに変更しました'); } } break;
-      case 'addHist': openHistForm(id, null); break;
-      case 'editHist': openHistForm(id, el.dataset.hid); break;
-      case 'deleteHist':
-        it = getItem(id);
-        if (it) {
-          var hid = el.dataset.hid;
-          askConfirm('この購入記録を削除します。', '削除する', function () {
-            it.history = it.history.filter(function (x) { return x.id !== hid; });
-            persist(); render(); toast('削除しました');
-          });
-        }
-        break;
-      case 'deleteItem':
-        it = getItem(id);
-        if (it) {
-          askConfirm('「' + it.name + '」を削除します。購入履歴も消えます。', '削除する', function () {
-            state.items = state.items.filter(function (x) { return x.id !== id; });
-            persist(); location.hash = '#home'; render(); toast('削除しました');
-          });
-        }
-        break;
-      case 'clearPhoto': {
-        form.photo = null;
-        var f = document.getElementById('item-form');
-        var prev = document.getElementById('photo-prev');
-        if (prev && f) prev.innerHTML = IL[kindOf(f.elements.category.value)];
-        el.remove();
-        break;
-      }
-      case 'closeModal': closeModal(); break;
-      case 'retYes': retAnswer(true); break;
-      case 'retNo': retAnswer(false); break;
-      case 'enableNotify': enableNotify(); break;
-      case 'disableNotify': disableNotify(); break;
-      case 'testNotify': testNotify(); break;
-      case 'install': doInstall(); break;
-      case 'doUpdate': doUpdate(); break;
-      case 'export': exportData(); break;
-      case 'renameCat': renameCat(el.dataset.cat); break;
-      case 'delCat': delCat(el.dataset.cat); break;
-      case 'sample': sample(); break;
-    }
-  });
-  document.addEventListener('input', function (e) {
-    var t = e.target;
-    if (t.id === 'q') {
-      ui.q = t.value;
-      var b = document.getElementById('home-body');
-      if (b) b.innerHTML = homeBody();
-    } else if (t.name === 'url' && t.form && t.form.id === 'item-form') {
-      var s = detectSite(t.value.trim());
-      if (s) { var r = t.form.querySelector('input[name=site][value=' + s + ']'); if (r) r.checked = true; }
-    }
-  });
-  document.addEventListener('change', async function (e) {
-    var t = e.target;
-    if (t.id === 'photo-file' && t.files && t.files[0]) {
-      try {
-        form.photo = await resizeImage(t.files[0]);
-        document.getElementById('photo-prev').innerHTML = '<img src="' + form.photo + '" alt="">';
-      } catch (err) { toast('写真を読み込めませんでした'); }
-    } else if (t.id === 'import-file' && t.files && t.files[0]) {
-      await importData(t.files[0]);
-      t.value = '';
-    } else if (t.id === 'qs' || t.id === 'qe') {
-      state.settings[t.id === 'qs' ? 'quietStart' : 'quietEnd'] = parseInt(t.value, 10);
-      persist(); render(); toast('保存しました');
-    } else if (t.name === 'category' && t.form && t.form.id === 'item-form') {
-      var it = getItem(t.form.dataset.id);
-      var hasPhoto = form.photo || (form.photo === undefined && it && it.image);
-      if (!hasPhoto) document.getElementById('photo-prev').innerHTML = IL[kindOf(t.value)];
-    }
-  });
-  document.addEventListener('submit', function (e) {
-    var f = e.target;
-    if (f.id === 'item-form') { e.preventDefault(); saveItem(f); }
-    else if (f.id === 'hist-form') { e.preventDefault(); saveHist(f); }
-    else if (f.id === 'cat-form') { e.preventDefault(); addCat(new FormData(f).get('cat')); }
-    else if (f.id === 'rename-form') { e.preventDefault(); renameCatTo(f.dataset.cat, new FormData(f).get('cat')); }
-  });
-  document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') {
-      if (modalRoot.innerHTML) closeModal();
-      else if (ui.drawer) { ui.drawer = false; render(); }
-    }
-  });
-  window.addEventListener('hashchange', function () { ui.drawer = false; render(); window.scrollTo(0, 0); });
-  document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'visible' && state) { render(); checkPending(); checkUpdate(false); }
-  });
-  window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); deferredInstall = e; if (state) render(); });
 
   /* ---------- アップデート ---------- */
   async function checkUpdate(force) {
@@ -924,18 +1124,180 @@
     location.reload();
   }
 
+  /* ---------- イベント ---------- */
+  document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    if (t.classList && t.classList.contains('modal-backdrop')) {
+      if (modalRoot.querySelector('.ret')) return; /* 購入確認は答えるまで閉じない */
+      if (modalRoot.querySelector('.attach')) sharePhoto = null;
+      closeModal();
+      return;
+    }
+    if (t.classList && t.classList.contains('drawer-backdrop')) { ui.drawer = false; render(); return; }
+    var el = t.closest && t.closest('[data-action]');
+    if (!el) return;
+    var a = el.dataset.action, id = el.dataset.id, e;
+    switch (a) {
+      case 'drawer': ui.drawer = true; render(); break;
+      case 'closeDrawer': ui.drawer = false; setTimeout(render, 0); break;
+      case 'add': ui.drawer = false; render(); openItemForm({}); break;
+      case 'addBrand': openItemForm({ groupId: id }); break;
+      case 'edit': openItemForm({ id: id, vid: el.dataset.vid }); break;
+      case 'brands': openBrands(id); break;
+      case 'buy':
+        if (el.dataset.nolink) { ev.preventDefault(); toast('商品ページのリンクが未登録です'); openItemForm({ id: id, vid: el.dataset.vid }); }
+        else buy(id, el.dataset.vid);
+        break;
+      case 'snooze': snooze(id); break;
+      case 'site': ui.site = el.dataset.site; render(); break;
+      case 'catPick': openCatPick(); break;
+      case 'setCat': ui.cat = el.dataset.cat === '__all' ? null : el.dataset.cat; closeModal(); render(); break;
+      case 'setMust': e = getItem(id); if (e) { e.must = el.dataset.v === '1'; persist(); render(); } break;
+      case 'cycle': e = getItem(id); if (e) { e.cycle = clampInt(e.cycle + Number(el.dataset.d), 1, 365, e.cycle); if (e.notifyBefore > e.cycle) e.notifyBefore = e.cycle; persist(); render(); } break;
+      case 'setCycle': e = getItem(id); if (e) { e.cycle = clampInt(el.dataset.v, 1, 365, e.cycle); if (e.notifyBefore > e.cycle) e.notifyBefore = e.cycle; persist(); render(); toast(e.cycle + '日ごとにしました'); } break;
+      case 'formCycle': {
+        var ci = document.getElementById('f-cycle');
+        if (ci) ci.value = el.dataset.v;
+        el.parentNode.querySelectorAll('.chip').forEach(function (c) { c.classList.toggle('on', c === el); });
+        break;
+      }
+      case 'notify': e = getItem(id); if (e) { e.notifyBefore = clampInt(e.notifyBefore + Number(el.dataset.d), 0, Math.min(30, e.cycle), e.notifyBefore); persist(); render(); } break;
+      case 'applyAvg': e = getItem(id); if (e) { var sg = suggestion(e) || { to: Math.max(1, Math.round(avgInterval(e) || e.cycle)) }; e.cycle = sg.to; e.suggestOff = null; persist(); render(); toast(e.cycle + '日ごとに変更しました'); } break;
+      case 'dismissSuggest': e = getItem(id); if (e) { e.suggestOff = e.history.length; persist(); render(); toast('次に買うまで提案しません'); } break;
+      case 'addHist': openHistForm(id, null); break;
+      case 'editHist': openHistForm(id, el.dataset.hid); break;
+      case 'deleteHist':
+        e = getItem(id);
+        if (e) {
+          var hid = el.dataset.hid;
+          askConfirm('この購入記録を削除します。', '削除する', function () {
+            e.history = e.history.filter(function (x) { return x.id !== hid; });
+            persist(); render(); toast('削除しました');
+          });
+        }
+        break;
+      case 'deleteItem':
+        e = getItem(id);
+        if (e) {
+          var dv = getVariant(e, el.dataset.vid);
+          if (multi(e) && dv) {
+            askConfirm('銘柄「' + dv.name + '」を削除します。この銘柄の購入履歴は、品目の履歴として残ります。', '削除する', function () {
+              e.variants = e.variants.filter(function (x) { return x.id !== dv.id; });
+              e.history.forEach(function (h) { if (h.variantId === dv.id) h.variantId = curVariant(e).id; });
+              if (e.variants.length === 1) e.name = '';
+              persist(); render(); toast('削除しました');
+            });
+          } else {
+            askConfirm('「' + entryLabel(e) + '」を削除します。購入履歴も消えます。', '削除する', function () {
+              state.items = state.items.filter(function (x) { return x.id !== id; });
+              state.pending = state.pending.filter(function (p) { return p.itemId !== id; });
+              persist(); location.hash = '#home'; render(); toast('削除しました');
+            });
+          }
+        }
+        break;
+      case 'clearPhoto': {
+        form.photo = null;
+        var f = document.getElementById('item-form');
+        var prev = document.getElementById('photo-prev');
+        if (prev && f) prev.innerHTML = IL[kindOf(f.elements.category ? f.elements.category.value : '')];
+        el.remove();
+        break;
+      }
+      case 'closeModal': closeModal(); if (state.pending.length) setTimeout(showReturn, 200); break;
+      case 'confirmOk': { var fn = pendingConfirm; pendingConfirm = null; closeModal(); if (fn) fn(); break; }
+      case 'retYes': retAnswer(true); break;
+      case 'retNo': retAnswer(false); break;
+      case 'attachYes': attachTo(id, el.dataset.vid); break;
+      case 'attachPick': openAttachPick(); break;
+      case 'attachNew': openItemForm({ fromShare: true, prefill: { image: sharePhoto } }); sharePhoto = null; break;
+      case 'attachCancel': sharePhoto = null; closeModal(); break;
+      case 'enableNotify': enableNotify(); break;
+      case 'disableNotify': disableNotify(); break;
+      case 'testNotify': testNotify(); break;
+      case 'install': doInstall(); break;
+      case 'doUpdate': doUpdate(); break;
+      case 'export': exportData(); break;
+      case 'renameCat': renameCat(el.dataset.cat); break;
+      case 'delCat': delCat(el.dataset.cat); break;
+      case 'sample': sample(); break;
+    }
+  });
+  document.addEventListener('input', function (ev) {
+    var t = ev.target;
+    if (t.id === 'q') {
+      ui.q = t.value;
+      var b = document.getElementById('home-body');
+      if (b) b.innerHTML = homeBody();
+    } else if (t.id === 'f-url') {
+      var s = detectSite(t.value.trim());
+      if (s) { var r = t.form.querySelector('input[name=site][value=' + s + ']'); if (r) r.checked = true; }
+    } else if (t.id === 'f-cycle') {
+      t.form.querySelectorAll('.chip').forEach(function (c) { c.classList.toggle('on', c.dataset.v === t.value); });
+    }
+  });
+  document.addEventListener('change', async function (ev) {
+    var t = ev.target;
+    if (t.id === 'import-file' && t.files && t.files[0]) {
+      await importData(t.files[0]);
+      t.value = '';
+    } else if (t.id === 'qs' || t.id === 'qe') {
+      state.settings[t.id === 'qs' ? 'quietStart' : 'quietEnd'] = parseInt(t.value, 10);
+      persist(); render(); toast('保存しました');
+    } else if (t.name === 'confirmMode') {
+      state.settings.confirmMode = CONFIRM_MODES.indexOf(t.value) >= 0 ? t.value : 'ask';
+      persist(); toast('保存しました');
+    } else if (t.id === 'f-group') {
+      var g = getItem(t.value);
+      var fm = t.form;
+      fm.querySelector('.entry-fields').hidden = !!g;
+      fm.querySelector('.gname-field').hidden = !g;
+      if (g) fm.querySelector('#f-gname').value = g.name || '';
+    } else if (t.id === 'f-cat') {
+      var hasPhoto = !!form.photo || (form.photo === undefined && document.querySelector('#photo-prev img'));
+      if (!hasPhoto) document.getElementById('photo-prev').innerHTML = IL[kindOf(t.value)];
+    }
+  });
+  document.addEventListener('submit', function (ev) {
+    var f = ev.target;
+    if (f.id === 'item-form') { ev.preventDefault(); saveItem(f); }
+    else if (f.id === 'hist-form') { ev.preventDefault(); saveHist(f); }
+    else if (f.id === 'cat-form') { ev.preventDefault(); addCat(new FormData(f).get('cat')); }
+    else if (f.id === 'rename-form') { ev.preventDefault(); renameCatTo(f.dataset.cat, new FormData(f).get('cat')); }
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape') {
+      if (modalRoot.querySelector('.ret')) return;
+      if (modalRoot.innerHTML) { sharePhoto = null; closeModal(); }
+      else if (ui.drawer) { ui.drawer = false; render(); }
+    }
+  });
+  window.addEventListener('hashchange', function () {
+    if (location.hash === '#share') { processInbox(); return; }
+    ui.drawer = false; render(); window.scrollTo(0, 0);
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible' || !state) return;
+    if (location.hash === '#share') { processInbox(); return; }
+    if (!modalRoot.innerHTML) render();
+    showReturn();
+    checkUpdate(false);
+  });
+  window.addEventListener('beforeinstallprompt', function (ev) { ev.preventDefault(); deferredInstall = ev; if (state && !modalRoot.innerHTML) render(); });
+
   /* ---------- 起動 ---------- */
   async function init() {
     var s = null;
     try { s = await DB.load(); } catch (e) { s = null; }
     try { state = s ? normalizeLoaded(s) : defaultState(); } catch (e) { state = defaultState(); }
-    render();
-    checkPending();
+    if (s && s.version !== 2) persist(); /* 旧い形のデータを新しい形で保存し直す */
+    if (location.hash === '#share') await processInbox(); else render();
+    showReturn();
     checkUpdate(true);
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* 無視 */ }
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(function () {
-        if (state.settings.notifyEnabled) return registerSync().then(function () { if (route().name === 'settings') render(); });
+        if (state.settings.notifyEnabled) return registerSync().then(function () { if (route().name === 'settings' && !modalRoot.innerHTML) render(); });
       }).catch(function () { syncStatus = 'unsupported'; });
     } else { syncStatus = 'unsupported'; }
   }

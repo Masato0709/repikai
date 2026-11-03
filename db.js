@@ -3,7 +3,6 @@
   'use strict';
   var DB_NAME = 'ripikai';
   var STORE = 'kv';
-  var KEY = 'state';
 
   function open() {
     return new Promise(function (res, rej) {
@@ -13,24 +12,22 @@
       r.onerror = function () { rej(r.error); };
     });
   }
-
-  async function load() {
+  async function getKV(key) {
     try {
       var db = await open();
       return await new Promise(function (res, rej) {
-        var q = db.transaction(STORE, 'readonly').objectStore(STORE).get(KEY);
-        q.onsuccess = function () { res(q.result || null); };
+        var q = db.transaction(STORE, 'readonly').objectStore(STORE).get(key);
+        q.onsuccess = function () { res(q.result === undefined ? null : q.result); };
         q.onerror = function () { rej(q.error); };
       });
     } catch (e) { return null; }
   }
-
-  async function save(state) {
+  async function setKV(key, val) {
     try {
       var db = await open();
       await new Promise(function (res, rej) {
         var tx = db.transaction(STORE, 'readwrite');
-        tx.objectStore(STORE).put(state, KEY);
+        if (val === null) tx.objectStore(STORE).delete(key); else tx.objectStore(STORE).put(val, key);
         tx.oncomplete = res;
         tx.onerror = function () { rej(tx.error); };
       });
@@ -67,6 +64,18 @@
     return { last: last, due: due, left: diffDays(due, today) };
   }
 
+  /* 最近買っていない：周期の2倍を過ぎ、かつ21日以上買っていない */
+  var STALE_MIN_DAYS = 21;
+  function isStale(item, today) {
+    today = today || todayStr();
+    if (!item.must) return false;
+    var last = lastPurchase(item);
+    if (!last) return false;
+    if (item.snoozeUntil && item.snoozeUntil > today) return false;
+    var elapsed = diffDays(today, last);
+    return elapsed >= 2 * (item.cycle || 1) && elapsed >= STALE_MIN_DAYS;
+  }
+
   /* 通知しない時間帯か（例：22時〜9時） */
   function isQuiet(settings, date) {
     var h = (date || new Date()).getHours();
@@ -75,20 +84,36 @@
     return s < e ? (h >= s && h < e) : (h >= s || h < e);
   }
 
+  function displayName(item) {
+    var v = item.variants && item.variants.length ? item.variants : null;
+    if (!v) return item.name || '';
+    var hs = (item.history || []).slice().sort(function (a, b) { return b.date.localeCompare(a.date); });
+    for (var i = 0; i < hs.length; i++) {
+      for (var j = 0; j < v.length; j++) if (v[j].id === hs[i].variantId) return v[j].name;
+    }
+    return v[0].name;
+  }
+
   function notifyTargets(state, now) {
     now = now || new Date();
     var today = todayStr(now);
     var notified = state.notified || {};
     return state.items.filter(function (it) {
       if (!it.must || !it.history || !it.history.length) return false;
+      if (isStale(it, today)) return false;
       var before = typeof it.notifyBefore === 'number' ? it.notifyBefore : 1;
       return dueInfo(it, today).left <= before && notified[it.id] !== today;
     });
   }
 
-  g.RepiDB = { load: load, save: save };
+  g.RepiDB = {
+    load: function () { return getKV('state'); },
+    save: function (s) { return setKV('state', s); },
+    getKV: getKV, setKV: setKV
+  };
   g.RepiCore = {
     todayStr: todayStr, addDays: addDays, diffDays: diffDays, lastPurchase: lastPurchase,
-    dueInfo: dueInfo, isQuiet: isQuiet, notifyTargets: notifyTargets
+    dueInfo: dueInfo, isStale: isStale, isQuiet: isQuiet, notifyTargets: notifyTargets,
+    displayName: displayName, STALE_MIN_DAYS: STALE_MIN_DAYS
   };
 })(self);
