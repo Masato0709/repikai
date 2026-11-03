@@ -1,7 +1,7 @@
 /* リピ買い：サービスワーカー（オフライン表示・共有の受け取り・買いどき通知） */
 importScripts('db.js');
 
-var VERSION = '1.1.1';
+var VERSION = '1.1.2';
 var CACHE = 'ripikai-' + VERSION;
 var ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/badge-96.png'];

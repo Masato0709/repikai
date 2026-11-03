@@ -344,3 +344,9 @@ a.btn-buy, a.btn-primary, a.btn-ghost { text-decoration: none; }
 .step-num input { width: 64px; height: 44px; padding: 0 6px; border: 1.5px solid var(--line); border-radius: 12px; background: #fff; color: var(--ink); font-family: inherit; font-size: 19px; font-weight: 700; text-align: center; }
 .step-num input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 .step-num span { font-size: 15px; font-weight: 700; }
+.guide-ways { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 14px 0 4px; text-align: left; }
+.way { padding: 14px 16px; border-radius: 16px; background: var(--tint2); font-size: 14px; }
+.way .howto { margin-top: 6px; font-size: 13px; }
+.inbox-log { margin: 16px 0 4px; padding: 14px 16px; border-radius: 16px; background: var(--bg); border: 1px solid var(--row); font-size: 13px; }
+.inbox-log .info { margin: 8px 0 0; grid-template-columns: 64px minmax(0, 1fr); font-size: 13px; }
+@media (max-width: 560px) { .guide-ways { grid-template-columns: minmax(0, 1fr); } }

@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   var C = self.RepiCore, DB = self.RepiDB;
-  var APP_VERSION = '1.1.1';
+  var APP_VERSION = '1.1.2';
   var SITES = { amazon: 'Amazon', yodobashi: 'ヨドバシ.com', rakuten: '楽天', other: 'その他' };
   var SITE_KEYS = Object.keys(SITES);
   var DEFAULT_CATS = ['飲料', '食品', '洗剤・掃除', '紙類', '衛生用品', 'その他'];
@@ -119,6 +119,21 @@
     t = t.replace(/\s*[-－|｜]\s*(Amazon\.co\.jp|ヨドバシ\.com|楽天市場)\s*$/i, '');
     return t.trim().slice(0, 60);
   }
+  /* 写真として使えるもの：端末で縮めた画像か、https の画像アドレス */
+  function okImage(x) {
+    if (typeof x !== 'string') return null;
+    if (x.indexOf('data:image/') === 0) return x;
+    var u = safeUrl(x);
+    return u && u.indexOf('https:') === 0 ? u : null;
+  }
+  function isImageUrl(u) {
+    try {
+      var x = new URL(u);
+      return /\.(jpe?g|png|webp|gif|avif)$/i.test(x.pathname) ||
+        /(^|\.)(media-amazon\.com|images-amazon\.com|ssl-images-amazon\.com|image\.rakuten\.co\.jp|thumbnail\.image\.rakuten\.co\.jp|image\.yodobashi\.com)$/.test(x.hostname);
+    } catch (e) { return false; }
+  }
+  function allUrls(s) { return String(s || '').match(/https?:\/\/[^\s"'<>]+/g) || []; }
   function findUrl(s) { var m = String(s || '').match(/https?:\/\/[^\s"'<>]+/); return m ? m[0] : ''; }
 
   var toastT;
@@ -144,7 +159,7 @@
       name: str(v.name, 60) || '名前なし',
       url: tidyUrl(v.url || '') || '',
       site: SITE_KEYS.indexOf(v.site) >= 0 ? v.site : 'other',
-      image: typeof v.image === 'string' && v.image.indexOf('data:image/') === 0 ? v.image : null,
+      image: okImage(v.image),
       price: numOrNull(v.price),
       createdAt: String(v.createdAt || new Date().toISOString())
     };
@@ -275,7 +290,8 @@
     for (var i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
     return 'var(--tint' + (h % 3 + 1) + ')';
   }
-  function thumbInner(v, cat) { return v && v.image ? '<img src="' + esc(v.image) + '" alt="">' : IL[kindOf(cat)]; }
+  function imgTag(src, alt) { return '<img src="' + esc(src) + '" alt="' + esc(alt || '') + '" referrerpolicy="no-referrer">'; }
+  function thumbInner(v, cat) { return v && v.image ? imgTag(v.image) : IL[kindOf(cat)]; }
   function siteLabel(v) { return SITES[v.site] || 'その他'; }
   function buyLabel(v) { return v.site === 'other' ? 'サイトで購入する' : siteLabel(v) + 'で購入する'; }
   /* 購入ボタンは本物のリンク（ブラウザで商品ページが開く） */
@@ -586,6 +602,7 @@
       '<select id="qe" aria-label="終了時刻">' + hours(st.quietEnd) + '</select><span>まで</span></div></section>' +
       '<section class="card set"><h2>購入の記録のしかた</h2><div class="radios">' + modes + '</div></section>' +
       '<section class="card set"><h2>共有から登録する</h2>' + shareHowTo() +
+      lastInboxHtml() +
       '<p class="note">「リピ買い」が共有先に出ないときは、ホーム画面に追加してあるか確認してください。追加してあっても出ないときは、ホーム画面のアイコンを一度削除して、もう一度追加してください。</p></section>' +
       '<section class="card set"><h2>カテゴリー</h2><div class="cat-list">' + cats + '</div>' +
       '<form id="cat-form" class="cat-add"><input id="cat-new" name="cat" maxlength="20" placeholder="新しいカテゴリー名" aria-label="新しいカテゴリー名"><button class="btn-ghost" type="submit">追加</button></form></section>' +
@@ -594,6 +611,18 @@
       '<label class="btn-ghost as-btn">ファイルから読み込む<input type="file" id="import-file" accept="application/json,.json" hidden></label></div></section>' +
       (deferredInstall ? '<section class="card set"><h2>ホーム画面に追加</h2><p class="note">アプリのように起動でき、共有からの登録や通知も使えるようになります。</p><button class="btn-primary" data-action="install">ホーム画面に追加する</button></section>' : '') +
       '<p class="ver">リピ買い ver ' + APP_VERSION + '</p></div>';
+  }
+
+  function lastInboxHtml() {
+    var b = ui.lastInbox;
+    if (!b) return '';
+    var d = new Date(b.at);
+    return '<div class="inbox-log"><b>最後に受け取った共有</b><dl class="info">' +
+      '<dt>日時</dt><dd>' + (d.getMonth() + 1) + '/' + d.getDate() + ' ' + d.getHours() + ':' + String(d.getMinutes()).padStart(2, '0') + '</dd>' +
+      '<dt>写真</dt><dd>' + (b.image ? 'あり（' + esc(b.image.type || '種類不明') + '、' + Math.round(b.image.size / 1024) + 'KB）' : 'なし') + '</dd>' +
+      '<dt>題名</dt><dd class="trunc">' + (esc(b.title) || '—') + '</dd>' +
+      '<dt>リンク</dt><dd class="trunc">' + (esc(b.url) || '—') + '</dd>' +
+      '<dt>文章</dt><dd class="trunc">' + (esc(b.text) || '—') + '</dd></dl></div>';
   }
 
   /* ---------- モーダル ---------- */
@@ -679,7 +708,7 @@
       '</div>' +
       '<div class="field-row"><label class="field"><span>' + (isNew ? '価格（円・任意）' : '前回価格（円）') + '</span><input id="f-price" name="price" type="number" min="0" inputmode="numeric" value="' + (vals.price == null ? '' : vals.price) + '"></label>' +
       (isNew ? '<label class="field"><span>前回買った日（任意）</span><input id="f-last" name="lastDate" type="date" max="' + C.todayStr() + '"></label>' : '') + '</div>' +
-      '<div class="field"><span>写真</span><div class="photo-row"><div class="thumb" id="photo-prev" style="background:var(--tint1)">' + (showImg ? '<img src="' + esc(showImg) + '" alt="">' : IL[kindOf(vals.category)]) + '</div>' +
+      '<div class="field"><span>写真</span><div class="photo-row"><div class="thumb" id="photo-prev" style="background:var(--tint1)">' + (showImg ? imgTag(showImg) : IL[kindOf(vals.category)]) + '</div>' +
       (showImg ? '<button type="button" class="link-btn" data-action="clearPhoto">写真を外す</button>' : '<small class="photo-note">保存したあと、Chromeで商品写真を長押し→「画像を共有」→「リピ買い」で付けられます</small>') + '</div></div>' +
       '<p class="form-err" id="form-err" role="alert"></p>' +
       '<div class="sheet-actions">' + (!isNew ? '<button type="button" class="link-btn danger" data-action="deleteItem" data-id="' + esc(e.id) + '" data-vid="' + esc(v.id) + '">' + (multi(e) ? 'この銘柄を削除' : 'この商品を削除') + '</button>' : '') +
@@ -741,14 +770,17 @@
     render();
     if (isNew && fromShare && !v.image) showPhotoGuide(v);
   }
-  function showPhotoGuide(v) {
-    openModal('<div class="dialog guide"><div class="guide-icon">' + ICON.photo + '</div><h2>続けて商品写真を共有してください</h2>' +
-      '<p class="muted">「' + esc(v.name) + '」に写真を付けます</p>' +
-      '<ol class="howto"><li>Chromeに戻り、商品ページの写真を<b>長押し</b>する</li><li>「<b>画像を共有</b>」を選ぶ</li><li>共有先から「<b>リピ買い</b>」を選ぶ</li></ol>' +
-      '<p class="note">30分以内に共有すると、この商品に自動で付きます。写真はあとからでも付けられます。</p>' +
+  function showPhotoGuide(v, already) {
+    openModal('<div class="dialog guide"><div class="guide-icon">' + ICON.photo + '</div>' +
+      '<h2>' + (already ? 'この商品は登録済みです。写真を付けましょう' : '続けて商品写真を共有してください') + '</h2>' +
+      '<p class="muted">「' + esc(v.name) + '」に写真を付けます' + (already ? '。届いたのはリンクだけで、写真は入っていませんでした' : '') + '</p>' +
+      '<div class="guide-ways"><div class="way"><b>方法1：写真を長押しして共有</b>' +
+      '<ol class="howto"><li>商品ページの写真を<b>長押し</b>する</li><li>メニューの下の方にある「<b>画像を共有</b>」を選ぶ（「リンクを共有」ではありません）</li><li>「<b>リピ買い</b>」を選ぶ</li></ol></div>' +
+      '<div class="way"><b>方法2：保存してからギャラリーで共有</b>' +
+      '<ol class="howto"><li>写真を長押し→「<b>画像をダウンロード</b>」</li><li>ギャラリーでその写真を開き「<b>共有</b>」</li><li>「<b>リピ買い</b>」を選ぶ</li></ol></div></div>' +
+      '<p class="note">30分以内に共有すると、この商品に自動で付きます。</p>' +
       '<div class="sheet-actions"><span class="sp"></span><button class="btn-primary" data-action="closeModal">わかりました</button></div></div>');
   }
-
   function openHistForm(eid, hid) {
     var e = getItem(eid);
     if (!e) return;
@@ -870,10 +902,18 @@
     if (location.hash === '#share') history.replaceState(null, '', location.pathname + location.search + '#home');
     if (!box) { render(); return; }
     await DB.setKV('inbox', null);
+    /* うまくいかないときの確認用に、何が届いたかを残す（写真そのものは残さない） */
+    ui.lastInbox = {
+      at: Number(box.at) || Date.now(), title: String(box.title || '').slice(0, 120), text: String(box.text || '').slice(0, 200),
+      url: String(box.url || '').slice(0, 200), image: box.image ? { type: String(box.image.type || ''), size: Number(box.image.size) || 0 } : null
+    };
+    DB.setKV('lastInbox', ui.lastInbox);
     if (Date.now() - (Number(box.at) || 0) > 24 * 3600 * 1000) { render(); return; }
-    var url = findUrl(box.url) || findUrl(box.text) || '';
+    var urls = allUrls(box.url).concat(allUrls(box.text));
+    var imgUrl = urls.find(isImageUrl) || '';
+    var url = urls.find(function (u) { return !isImageUrl(u); }) || '';
     var site = detectSite(url) || 'other';
-    var rawTitle = box.title || String(box.text || '').replace(url, '').trim();
+    var rawTitle = box.title || urls.reduce(function (t, u) { return t.replace(u, ''); }, String(box.text || '')).trim();
     var name = cleanTitle(rawTitle, site);
     var key = urlKey(url);
     var match = null;
@@ -883,8 +923,12 @@
       });
     }
     render();
-    if (box.image) {
-      try { sharePhoto = await resizeImage(box.image); } catch (err) { toast('写真を読み込めませんでした'); return; }
+    if (box.image || imgUrl) {
+      if (box.image) {
+        try { sharePhoto = await resizeImage(box.image); } catch (err) { toast('写真を読み込めませんでした'); return; }
+      } else {
+        sharePhoto = okImage(imgUrl);
+      }
       if (match) { confirmAttach(match.e, match.v); return; }
       if (url) {
         openItemForm({ fromShare: true, prefill: { name: name, url: tidyUrl(url) || '', site: site, image: sharePhoto } });
@@ -901,14 +945,22 @@
     }
     if (match) {
       location.hash = '#item-' + match.e.id;
-      toast('「' + match.v.name + '」はもう登録されています');
+      render();
+      if (!match.v.image) {
+        /* 登録済みで写真がない商品なら、このあと届く写真をこの商品に付ける */
+        state.lastShared = { itemId: match.e.id, variantId: match.v.id, at: Date.now() };
+        persist();
+        showPhotoGuide(match.v, true);
+      } else {
+        toast('「' + match.v.name + '」はもう登録されています');
+      }
       return;
     }
     if (!url && !name) { toast('共有された内容を読み取れませんでした'); return; }
     openItemForm({ fromShare: true, prefill: { name: name, url: tidyUrl(url) || '', site: site } });
   }
   function confirmAttach(e, v) {
-    openModal('<div class="dialog attach"><h2>写真を付けますか？</h2><div class="attach-prev"><img src="' + esc(sharePhoto) + '" alt="共有された写真"></div>' +
+    openModal('<div class="dialog attach"><h2>写真を付けますか？</h2><div class="attach-prev">' + imgTag(sharePhoto, '共有された写真') + '</div>' +
       '<p class="confirm-msg">この写真を「<b>' + esc(v.name) + '</b>」に付けます。' + (v.image ? '今の写真と入れ替わります。' : '') + '</p>' +
       '<div class="sheet-actions"><button type="button" class="link-btn" data-action="attachPick">ほかの商品を選ぶ</button><span class="sp"></span>' +
       '<button type="button" class="btn-ghost" data-action="attachCancel">やめる</button>' +
@@ -926,7 +978,7 @@
       if (!a.v.image !== !b.v.image) return a.v.image ? 1 : -1;
       return String(b.v.createdAt).localeCompare(String(a.v.createdAt));
     });
-    openModal('<div class="dialog attach"><h2>どの商品の写真にしますか？</h2><div class="attach-prev sm"><img src="' + esc(sharePhoto) + '" alt="共有された写真"></div>' +
+    openModal('<div class="dialog attach"><h2>どの商品の写真にしますか？</h2><div class="attach-prev sm">' + imgTag(sharePhoto, '共有された写真') + '</div>' +
       '<div class="vlist pick-list">' + list.map(function (x) {
         return '<button type="button" class="vrow as-pick" data-action="attachYes" data-id="' + esc(x.e.id) + '" data-vid="' + esc(x.v.id) + '"><span class="thumb sm" style="background:' + tintOf(x.v.id) + '">' + thumbInner(x.v, x.e.category) + '</span>' +
           '<span class="g-name">' + esc(x.v.name) + '<small>' + siteLabel(x.v) + (x.v.image ? ' ・ 写真あり（入れ替え）' : ' ・ 写真なし') + '</small></span></button>';
@@ -1301,6 +1353,7 @@
     var s = null;
     try { s = await DB.load(); } catch (e) { s = null; }
     try { state = s ? normalizeLoaded(s) : defaultState(); } catch (e) { state = defaultState(); }
+    try { ui.lastInbox = await DB.getKV('lastInbox'); } catch (e) { ui.lastInbox = null; }
     if (s && s.version !== 2) persist(); /* 旧い形のデータを新しい形で保存し直す */
     if (location.hash === '#share') await processInbox(); else render();
     showReturn();
