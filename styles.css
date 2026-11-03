@@ -350,3 +350,7 @@ a.btn-buy, a.btn-primary, a.btn-ghost { text-decoration: none; }
 .inbox-log { margin: 16px 0 4px; padding: 14px 16px; border-radius: 16px; background: var(--bg); border: 1px solid var(--row); font-size: 13px; }
 .inbox-log .info { margin: 8px 0 0; grid-template-columns: 64px minmax(0, 1fr); font-size: 13px; }
 @media (max-width: 560px) { .guide-ways { grid-template-columns: minmax(0, 1fr); } }
+.way.main { background: var(--tint1); }
+.way .as-btn { margin-top: 10px; width: 100%; }
+.way small.muted { display: block; margin-top: 6px; font-size: 12px; line-height: 1.6; }
+.as-btn svg { width: 20px; height: 20px; }

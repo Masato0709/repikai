@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   var C = self.RepiCore, DB = self.RepiDB;
-  var APP_VERSION = '1.1.2';
+  var APP_VERSION = '1.1.3';
   var SITES = { amazon: 'Amazon', yodobashi: 'ヨドバシ.com', rakuten: '楽天', other: 'その他' };
   var SITE_KEYS = Object.keys(SITES);
   var DEFAULT_CATS = ['飲料', '食品', '洗剤・掃除', '紙類', '衛生用品', 'その他'];
@@ -290,6 +290,14 @@
     for (var i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
     return 'var(--tint' + (h % 3 + 1) + ')';
   }
+  /* 端末に保存した写真を選ぶボタン（共有がうまくいかないときも確実に付けられる） */
+  function pickBtn(e, v, label, cls) {
+    return '<label class="' + (cls || 'btn-ghost') + ' as-btn">' + ICON.photo.replace(/width="40" height="40"/, 'width="20" height="20"') + esc(label) +
+      '<input type="file" class="pick-photo" accept="image/*" data-id="' + esc(e.id) + '" data-vid="' + esc(v.id) + '" hidden></label>';
+  }
+  function entryOfVariant(vid) {
+    return state.items.find(function (e) { return e.variants.some(function (v) { return v.id === vid; }); }) || null;
+  }
   function imgTag(src, alt) { return '<img src="' + esc(src) + '" alt="' + esc(alt || '') + '" referrerpolicy="no-referrer">'; }
   function thumbInner(v, cat) { return v && v.image ? imgTag(v.image) : IL[kindOf(cat)]; }
   function siteLabel(v) { return SITES[v.site] || 'その他'; }
@@ -436,7 +444,7 @@
   function shareHowTo() {
     return '<ol class="howto"><li>Chromeで商品ページを開き、右上の「⋮」→「共有」→「<b>リピ買い</b>」を選ぶ</li>' +
       '<li>商品名とリンクが入った登録画面が開くので、周期を選んで保存する</li>' +
-      '<li>続けて、商品写真を長押し→「画像を共有」→「<b>リピ買い</b>」で写真が付く</li></ol>';
+      '<li>写真は、商品写真を長押し→「画像をダウンロード」してから、商品画面の「<b>写真を選ぶ</b>」で付ける</li></ol>';
   }
   function emptyState() {
     return '<div class="empty"><div class="thumb xl" style="background:var(--tint1)">' + IL.water + '</div>' +
@@ -497,8 +505,9 @@
       '<dt>前回購入</dt><dd>' + (s.last ? fmtLong(s.last) : '—') + '</dd>' +
       (e.must && !s.never && s.level !== 'stale' ? '<dt>次の買いどき</dt><dd><b>' + fmtLong(s.due) + '</b></dd>' : '') + '</dl>' +
       (s.level === 'stale' ? '<p class="note stale-note">しばらく買っていないため、通知を止めています。また買うと元に戻ります。</p>' : '') +
-      (!v.image ? '<p class="note">写真は、Chromeで商品写真を長押し→「画像を共有」→「リピ買い」で付けられます。</p>' : '') +
+      (!v.image ? '<p class="note">写真は、Chromeで商品写真を長押し→「画像をダウンロード」してから、「写真を選ぶ」で付けられます。</p>' : '') +
       '<div class="btn-row"><button class="btn-ghost" data-action="edit" data-id="' + eid + '" data-vid="' + vid + '">' + ICON.pencil + '編集する</button>' +
+      pickBtn(e, v, v.image ? '写真を変える' : '写真を選ぶ') +
       '<button class="btn-ghost" data-action="addBrand" data-id="' + eid + '">' + ICON.plus + '銘柄を追加</button></div></section>' +
       brands +
       (e.must ? '<section class="card"><h2>周期と通知</h2><div class="steps">' +
@@ -709,7 +718,9 @@
       '<div class="field-row"><label class="field"><span>' + (isNew ? '価格（円・任意）' : '前回価格（円）') + '</span><input id="f-price" name="price" type="number" min="0" inputmode="numeric" value="' + (vals.price == null ? '' : vals.price) + '"></label>' +
       (isNew ? '<label class="field"><span>前回買った日（任意）</span><input id="f-last" name="lastDate" type="date" max="' + C.todayStr() + '"></label>' : '') + '</div>' +
       '<div class="field"><span>写真</span><div class="photo-row"><div class="thumb" id="photo-prev" style="background:var(--tint1)">' + (showImg ? imgTag(showImg) : IL[kindOf(vals.category)]) + '</div>' +
-      (showImg ? '<button type="button" class="link-btn" data-action="clearPhoto">写真を外す</button>' : '<small class="photo-note">保存したあと、Chromeで商品写真を長押し→「画像を共有」→「リピ買い」で付けられます</small>') + '</div></div>' +
+      '<label class="btn-ghost sm as-btn">写真を選ぶ<input type="file" id="form-photo-file" accept="image/*" hidden></label>' +
+      (showImg ? '<button type="button" class="link-btn" data-action="clearPhoto">写真を外す</button>' : '') +
+      '<small class="photo-note">Chromeで商品写真を長押し→「画像をダウンロード」してから選べます</small></div></div>' +
       '<p class="form-err" id="form-err" role="alert"></p>' +
       '<div class="sheet-actions">' + (!isNew ? '<button type="button" class="link-btn danger" data-action="deleteItem" data-id="' + esc(e.id) + '" data-vid="' + esc(v.id) + '">' + (multi(e) ? 'この銘柄を削除' : 'この商品を削除') + '</button>' : '') +
       '<span class="sp"></span><button type="button" class="btn-ghost" data-action="closeModal">キャンセル</button><button type="submit" class="btn-primary">保存する</button></div></form>');
@@ -771,15 +782,17 @@
     if (isNew && fromShare && !v.image) showPhotoGuide(v);
   }
   function showPhotoGuide(v, already) {
+    var ge = entryOfVariant(v.id);
     openModal('<div class="dialog guide"><div class="guide-icon">' + ICON.photo + '</div>' +
       '<h2>' + (already ? 'この商品は登録済みです。写真を付けましょう' : '続けて商品写真を共有してください') + '</h2>' +
       '<p class="muted">「' + esc(v.name) + '」に写真を付けます' + (already ? '。届いたのはリンクだけで、写真は入っていませんでした' : '') + '</p>' +
-      '<div class="guide-ways"><div class="way"><b>方法1：写真を長押しして共有</b>' +
-      '<ol class="howto"><li>商品ページの写真を<b>長押し</b>する</li><li>メニューの下の方にある「<b>画像を共有</b>」を選ぶ（「リンクを共有」ではありません）</li><li>「<b>リピ買い</b>」を選ぶ</li></ol></div>' +
-      '<div class="way"><b>方法2：保存してからギャラリーで共有</b>' +
-      '<ol class="howto"><li>写真を長押し→「<b>画像をダウンロード</b>」</li><li>ギャラリーでその写真を開き「<b>共有</b>」</li><li>「<b>リピ買い</b>」を選ぶ</li></ol></div></div>' +
-      '<p class="note">30分以内に共有すると、この商品に自動で付きます。</p>' +
-      '<div class="sheet-actions"><span class="sp"></span><button class="btn-primary" data-action="closeModal">わかりました</button></div></div>');
+      '<div class="guide-ways"><div class="way main"><b>おすすめ：保存して選ぶ（確実）</b>' +
+      '<ol class="howto"><li>Chromeで商品写真を<b>長押し</b>→「<b>画像をダウンロード</b>」</li><li>このアプリに戻り、下の「<b>写真を選ぶ</b>」を押す</li><li>ダウンロードした写真を選ぶ</li></ol>' +
+      (ge ? pickBtn(ge, v, '写真を選ぶ', 'btn-primary') : '') + '</div>' +
+      '<div class="way"><b>または：長押しして共有</b>' +
+      '<ol class="howto"><li>商品写真を<b>長押し</b>→「<b>画像を共有</b>」</li><li>「<b>リピ買い</b>」を選ぶ</li></ol>' +
+      '<small class="muted">Chromeの都合で、写真ではなくリンクだけが届くことがあります</small></div></div>' +
+      '<div class="sheet-actions"><span class="sp"></span><button class="btn-ghost" data-action="closeModal">あとで付ける</button></div></div>');
   }
   function openHistForm(eid, hid) {
     var e = getItem(eid);
@@ -1290,7 +1303,18 @@
   });
   document.addEventListener('change', async function (ev) {
     var t = ev.target;
-    if (t.id === 'import-file' && t.files && t.files[0]) {
+    if (t.classList.contains('pick-photo') && t.files && t.files[0]) {
+      var pe = getItem(t.dataset.id), pv = pe && getVariant(pe, t.dataset.vid);
+      if (!pv) return;
+      try { pv.image = await resizeImage(t.files[0]); } catch (err) { toast('写真を読み込めませんでした'); return; }
+      if (state.lastShared && state.lastShared.variantId === pv.id) state.lastShared = null;
+      persist(); closeModal(); location.hash = '#item-' + pe.id; render(); toast('写真を付けました');
+    } else if (t.id === 'form-photo-file' && t.files && t.files[0]) {
+      try {
+        form.photo = await resizeImage(t.files[0]);
+        document.getElementById('photo-prev').innerHTML = imgTag(form.photo);
+      } catch (err) { toast('写真を読み込めませんでした'); }
+    } else if (t.id === 'import-file' && t.files && t.files[0]) {
       await importData(t.files[0]);
       t.value = '';
     } else if (t.id === 'qs' || t.id === 'qe') {
