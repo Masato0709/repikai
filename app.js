@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   var C = self.RepiCore, DB = self.RepiDB;
-  var APP_VERSION = '1.1.3';
+  var APP_VERSION = '1.1.4';
   var SITES = { amazon: 'Amazon', yodobashi: 'ヨドバシ.com', rakuten: '楽天', other: 'その他' };
   var SITE_KEYS = Object.keys(SITES);
   var DEFAULT_CATS = ['飲料', '食品', '洗剤・掃除', '紙類', '衛生用品', 'その他'];
@@ -508,6 +508,7 @@
       (!v.image ? '<p class="note">写真は、Chromeで商品写真を長押し→「画像をダウンロード」してから、「写真を選ぶ」で付けられます。</p>' : '') +
       '<div class="btn-row"><button class="btn-ghost" data-action="edit" data-id="' + eid + '" data-vid="' + vid + '">' + ICON.pencil + '編集する</button>' +
       pickBtn(e, v, v.image ? '写真を変える' : '写真を選ぶ') +
+      (v.image && v.image.indexOf('data:') === 0 ? '<button class="btn-ghost" data-action="recrop" data-id="' + eid + '" data-vid="' + vid + '">写真を調整</button>' : '') +
       '<button class="btn-ghost" data-action="addBrand" data-id="' + eid + '">' + ICON.plus + '銘柄を追加</button></div></section>' +
       brands +
       (e.must ? '<section class="card"><h2>周期と通知</h2><div class="steps">' +
@@ -938,7 +939,8 @@
     render();
     if (box.image || imgUrl) {
       if (box.image) {
-        try { sharePhoto = await resizeImage(box.image); } catch (err) { toast('写真を読み込めませんでした'); return; }
+        sharePhoto = await cropImage(box.image);
+        if (!sharePhoto) { toast('写真の取り込みをやめました'); return; }
       } else {
         sharePhoto = okImage(imgUrl);
       }
@@ -1009,6 +1011,128 @@
     location.hash = '#item-' + e.id;
     render();
     toast('写真を付けました');
+  }
+
+  /* ---------- 写真の調整（位置・大きさ・回転を決めて、正方形で保存） ---------- */
+  var cropRoot = (function () {
+    var el = document.getElementById('crop-root');
+    if (!el) { el = document.createElement('div'); el.id = 'crop-root'; document.body.appendChild(el); }
+    return el;
+  })();
+  var cropCancel = null;
+  function loadImg(src) {
+    return new Promise(function (res, rej) {
+      var isStr = typeof src === 'string';
+      var url = isStr ? src : URL.createObjectURL(src);
+      var img = new Image();
+      img.onload = function () { if (!isStr) URL.revokeObjectURL(url); res(img); };
+      img.onerror = function () { if (!isStr) URL.revokeObjectURL(url); rej(new Error('image')); };
+      img.src = url;
+    });
+  }
+  async function cropImage(src) {
+    var img;
+    try { img = await loadImg(src); } catch (e) { toast('写真を読み込めませんでした'); return null; }
+    var k = Math.min(1, 1600 / Math.max(img.width, img.height));
+    var base = document.createElement('canvas');
+    base.width = Math.max(1, Math.round(img.width * k));
+    base.height = Math.max(1, Math.round(img.height * k));
+    base.getContext('2d').drawImage(img, 0, 0, base.width, base.height);
+    return new Promise(function (resolve) {
+      cropRoot.innerHTML = '<div class="crop-backdrop"><div class="dialog crop" role="dialog" aria-label="写真の調整">' +
+        '<h2>写真を調整</h2><p class="muted crop-help">指でずらして位置を、2本指か下のつまみで大きさを決めます</p>' +
+        '<div class="crop-stage" id="crop-stage"><canvas id="crop-canvas" width="720" height="720"></canvas><div class="crop-frame"></div></div>' +
+        '<div class="crop-tools"><button type="button" class="icon-btn round" id="crop-out" aria-label="小さくする">−</button>' +
+        '<input type="range" id="crop-zoom" min="0" max="1000" value="0" aria-label="大きさ">' +
+        '<button type="button" class="icon-btn round" id="crop-in" aria-label="大きくする">＋</button></div>' +
+        '<div class="crop-tools"><button type="button" class="btn-ghost sm" id="crop-fit">全体を表示</button>' +
+        '<button type="button" class="btn-ghost sm" id="crop-fill">枠いっぱい</button>' +
+        '<button type="button" class="btn-ghost sm" id="crop-rot">回転</button></div>' +
+        '<div class="sheet-actions"><span class="sp"></span><button type="button" class="btn-ghost" id="crop-cancel">やめる</button>' +
+        '<button type="button" class="btn-primary" id="crop-ok">この範囲で決定</button></div></div></div>';
+      var S = 720, cv = document.getElementById('crop-canvas'), ctx = cv.getContext('2d');
+      var stage = document.getElementById('crop-stage'), zoom = document.getElementById('crop-zoom');
+      var rot = 0, scale = 1, ox = 0, oy = 0;
+      function dims() { return rot % 2 ? [base.height, base.width] : [base.width, base.height]; }
+      function fitS() { var d = dims(); return S / Math.max(d[0], d[1]); }
+      function fillS() { var d = dims(); return S / Math.min(d[0], d[1]); }
+      function minS() { return fitS() * 0.6; }
+      function maxS() { return fillS() * 4; }
+      function syncZoom() { zoom.value = Math.round(Math.log(scale / minS()) / Math.log(maxS() / minS()) * 1000); }
+      function clamp() {
+        scale = Math.min(maxS(), Math.max(minS(), scale));
+        var d = dims(), hw = d[0] * scale / 2 + S / 2 - 60, hh = d[1] * scale / 2 + S / 2 - 60;
+        ox = Math.max(-hw, Math.min(hw, ox));
+        oy = Math.max(-hh, Math.min(hh, oy));
+      }
+      function paint(c, size) {
+        var f = size / S, g = c.getContext('2d');
+        g.setTransform(1, 0, 0, 1, 0, 0);
+        g.fillStyle = '#ffffff';
+        g.fillRect(0, 0, size, size);
+        g.translate(size / 2 + ox * f, size / 2 + oy * f);
+        g.rotate(rot * Math.PI / 2);
+        g.scale(scale * f, scale * f);
+        g.imageSmoothingQuality = 'high';
+        g.drawImage(base, -base.width / 2, -base.height / 2);
+      }
+      function draw() { clamp(); paint(cv, S); }
+      function setScale(ns, keepSlider) { scale = ns; clamp(); if (!keepSlider) syncZoom(); draw(); }
+      function reset(mode) { ox = 0; oy = 0; setScale(mode === 'fill' ? fillS() : fitS()); }
+      reset('fit');
+
+      var pts = {}, last = null, pinch = null;
+      function ratio() { return S / stage.getBoundingClientRect().width; }
+      stage.addEventListener('pointerdown', function (e) {
+        stage.setPointerCapture(e.pointerId);
+        pts[e.pointerId] = { x: e.clientX, y: e.clientY };
+        var ids = Object.keys(pts);
+        if (ids.length === 2) {
+          var a = pts[ids[0]], b = pts[ids[1]];
+          pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), s: scale };
+        }
+        last = { x: e.clientX, y: e.clientY };
+      });
+      stage.addEventListener('pointermove', function (e) {
+        if (!pts[e.pointerId]) return;
+        pts[e.pointerId] = { x: e.clientX, y: e.clientY };
+        var ids = Object.keys(pts);
+        if (ids.length >= 2 && pinch) {
+          var a = pts[ids[0]], b = pts[ids[1]];
+          setScale(pinch.s * Math.hypot(a.x - b.x, a.y - b.y) / Math.max(1, pinch.d));
+        } else if (last) {
+          var r = ratio();
+          ox += (e.clientX - last.x) * r;
+          oy += (e.clientY - last.y) * r;
+          draw();
+        }
+        last = { x: e.clientX, y: e.clientY };
+      });
+      function up(e) {
+        delete pts[e.pointerId];
+        if (Object.keys(pts).length < 2) pinch = null;
+        var rest = Object.keys(pts);
+        last = rest.length ? { x: pts[rest[0]].x, y: pts[rest[0]].y } : null;
+      }
+      stage.addEventListener('pointerup', up);
+      stage.addEventListener('pointercancel', up);
+      stage.addEventListener('wheel', function (e) { e.preventDefault(); setScale(scale * Math.exp(-e.deltaY * 0.0015)); }, { passive: false });
+      zoom.addEventListener('input', function () { setScale(minS() * Math.pow(maxS() / minS(), zoom.value / 1000), true); });
+      document.getElementById('crop-in').onclick = function () { setScale(scale * 1.15); };
+      document.getElementById('crop-out').onclick = function () { setScale(scale / 1.15); };
+      document.getElementById('crop-fit').onclick = function () { reset('fit'); };
+      document.getElementById('crop-fill').onclick = function () { reset('fill'); };
+      document.getElementById('crop-rot').onclick = function () { rot = (rot + 1) % 4; ox = 0; oy = 0; setScale(Math.min(Math.max(scale, fitS()), maxS())); };
+      function finish(val) { cropRoot.innerHTML = ''; cropCancel = null; resolve(val); }
+      cropCancel = function () { finish(null); };
+      document.getElementById('crop-cancel').onclick = function () { finish(null); };
+      document.getElementById('crop-ok').onclick = function () {
+        var out = document.createElement('canvas');
+        out.width = 480; out.height = 480;
+        paint(out, 480);
+        finish(out.toDataURL('image/jpeg', 0.85));
+      };
+    });
   }
 
   /* ---------- 通知 ---------- */
@@ -1277,6 +1401,11 @@
       case 'attachPick': openAttachPick(); break;
       case 'attachNew': openItemForm({ fromShare: true, prefill: { image: sharePhoto } }); sharePhoto = null; break;
       case 'attachCancel': sharePhoto = null; closeModal(); break;
+      case 'recrop': {
+        var re = getItem(id), rv = re && getVariant(re, el.dataset.vid);
+        if (rv && rv.image) cropImage(rv.image).then(function (d) { if (d) { rv.image = d; persist(); render(); toast('写真を調整しました'); } });
+        break;
+      }
       case 'enableNotify': enableNotify(); break;
       case 'disableNotify': disableNotify(); break;
       case 'testNotify': testNotify(); break;
@@ -1306,14 +1435,21 @@
     if (t.classList.contains('pick-photo') && t.files && t.files[0]) {
       var pe = getItem(t.dataset.id), pv = pe && getVariant(pe, t.dataset.vid);
       if (!pv) return;
-      try { pv.image = await resizeImage(t.files[0]); } catch (err) { toast('写真を読み込めませんでした'); return; }
+      var pf = t.files[0];
+      t.value = '';
+      var pdata = await cropImage(pf);
+      if (!pdata) return;
+      pv.image = pdata;
       if (state.lastShared && state.lastShared.variantId === pv.id) state.lastShared = null;
       persist(); closeModal(); location.hash = '#item-' + pe.id; render(); toast('写真を付けました');
     } else if (t.id === 'form-photo-file' && t.files && t.files[0]) {
-      try {
-        form.photo = await resizeImage(t.files[0]);
+      var ff = t.files[0];
+      t.value = '';
+      var fdata = await cropImage(ff);
+      if (fdata) {
+        form.photo = fdata;
         document.getElementById('photo-prev').innerHTML = imgTag(form.photo);
-      } catch (err) { toast('写真を読み込めませんでした'); }
+      }
     } else if (t.id === 'import-file' && t.files && t.files[0]) {
       await importData(t.files[0]);
       t.value = '';
@@ -1353,6 +1489,7 @@
     else if (f.id === 'rename-form') { ev.preventDefault(); renameCatTo(f.dataset.cat, new FormData(f).get('cat')); }
   });
   document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape' && cropCancel) { cropCancel(); return; }
     if (ev.key === 'Escape') {
       if (modalRoot.querySelector('.ret')) return;
       if (modalRoot.innerHTML) { sharePhoto = null; closeModal(); }
