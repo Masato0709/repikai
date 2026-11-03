@@ -10,6 +10,8 @@
   var modalRoot = document.getElementById('modal-root');
   var toastEl = document.getElementById('toast');
 
+  var APP_VERSION = '1.0.0';
+  var lastVerCheck = 0;
   var state = null;
   var memoryOnly = false;
   var deferredInstall = null;
@@ -205,7 +207,10 @@
     var dark = st.notifyEnabled
       ? esc(st.quietStart + ':00〜' + st.quietEnd + ':00 は通知をお休みします')
       : '通知はオフです ・ <a href="#prefs">設定でオンにする</a>';
-    return '<div class="band"><span>本日の買いどき ' + c.today + '点</span><span class="pill">REPEAT ORDER</span><span>3日以内 ' + c.soon + '点</span></div>' +
+    var upd = ui.updateReady
+      ? '<div class="update-bar"><span>新しいバージョン（ver ' + esc(ui.updateReady) + '）があります' + (ui.updateNote ? '：' + esc(ui.updateNote) : '') + '</span><button data-action="doUpdate">更新する</button></div>'
+      : '';
+    return upd + '<div class="band"><span>本日の買いどき ' + c.today + '点</span><span class="pill">REPEAT ORDER</span><span>3日以内 ' + c.soon + '点</span></div>' +
       '<div class="darkbar">' + dark + '</div>' +
       '<header class="hdr"><button class="icon-btn" data-action="drawer" aria-label="メニュー">' + ICON.menu + '</button>' +
       '<a class="logo" href="#home"><b>リピ買い<i>.</i></b><small>DAILY GOODS STORE</small></a>' +
@@ -431,7 +436,7 @@
       '<div class="set-actions"><button class="btn-ghost" data-action="export">ファイルに書き出す</button>' +
       '<label class="btn-ghost as-btn">ファイルから読み込む<input type="file" id="import-file" accept="application/json,.json" hidden></label></div></section>' +
       (deferredInstall ? '<section class="card set"><h2>ホーム画面に追加</h2><p class="note">アプリのように起動でき、通知も届きやすくなります。</p><button class="btn-primary" data-action="install">ホーム画面に追加する</button></section>' : '') +
-      '<p class="ver">リピ買い ver 1.0</p></div>';
+      '<p class="ver">リピ買い ver ' + APP_VERSION + '</p></div>';
   }
 
   /* ---------- モーダル ---------- */
@@ -837,6 +842,7 @@
       case 'disableNotify': disableNotify(); break;
       case 'testNotify': testNotify(); break;
       case 'install': doInstall(); break;
+      case 'doUpdate': doUpdate(); break;
       case 'export': exportData(); break;
       case 'renameCat': renameCat(el.dataset.cat); break;
       case 'delCat': delCat(el.dataset.cat); break;
@@ -888,9 +894,35 @@
   });
   window.addEventListener('hashchange', function () { ui.drawer = false; render(); window.scrollTo(0, 0); });
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'visible' && state) { render(); checkPending(); }
+    if (document.visibilityState === 'visible' && state) { render(); checkPending(); checkUpdate(false); }
   });
   window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); deferredInstall = e; if (state) render(); });
+
+  /* ---------- アップデート ---------- */
+  async function checkUpdate(force) {
+    if (!force && Date.now() - lastVerCheck < 30 * 60 * 1000) return;
+    lastVerCheck = Date.now();
+    try {
+      var r = await fetch('version.json?t=' + Date.now(), { cache: 'no-store' });
+      if (!r.ok) return;
+      var v = await r.json();
+      if (v && typeof v.version === 'string' && v.version !== APP_VERSION && ui.updateReady !== v.version) {
+        ui.updateReady = v.version.slice(0, 20);
+        ui.updateNote = typeof v.note === 'string' ? v.note.slice(0, 80) : '';
+        render();
+      }
+    } catch (e) { /* オフラインなど */ }
+  }
+  async function doUpdate() {
+    toast('更新しています…');
+    try {
+      var reg = navigator.serviceWorker && await navigator.serviceWorker.getRegistration();
+      if (reg) await reg.update();
+      var keys = await caches.keys();
+      await Promise.all(keys.map(function (k) { return caches.delete(k); }));
+    } catch (e) { /* そのまま読み直す */ }
+    location.reload();
+  }
 
   /* ---------- 起動 ---------- */
   async function init() {
@@ -899,9 +931,10 @@
     try { state = s ? normalizeLoaded(s) : defaultState(); } catch (e) { state = defaultState(); }
     render();
     checkPending();
+    checkUpdate(true);
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* 無視 */ }
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js').then(function () {
+      navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(function () {
         if (state.settings.notifyEnabled) return registerSync().then(function () { if (route().name === 'settings') render(); });
       }).catch(function () { syncStatus = 'unsupported'; });
     } else { syncStatus = 'unsupported'; }

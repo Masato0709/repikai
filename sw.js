@@ -1,7 +1,8 @@
 /* リピ買い：サービスワーカー（オフライン表示と買いどき通知） */
 importScripts('db.js');
 
-var CACHE = 'ripikai-v1';
+var VERSION = '1.0.0';
+var CACHE = 'ripikai-' + VERSION;
 var ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/badge-96.png'];
 
@@ -19,8 +20,10 @@ self.addEventListener('activate', function (e) {
 self.addEventListener('fetch', function (e) {
   var req = e.request;
   if (req.method !== 'GET') return;
-  if (new URL(req.url).origin !== self.location.origin) return;
-  e.respondWith(fetch(req).then(function (res) {
+  var u = new URL(req.url);
+  if (u.origin !== self.location.origin) return;
+  if (u.pathname.endsWith('/version.json')) return; /* 版の確認は常にネットへ */
+  e.respondWith(fetch(req.url, { cache: 'no-cache' }).then(function (res) {
     var copy = res.clone();
     caches.open(CACHE).then(function (c) { c.put(req, copy); });
     return res;
