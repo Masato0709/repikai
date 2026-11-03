@@ -340,3 +340,7 @@ a.btn-buy, a.btn-primary, a.btn-ghost { text-decoration: none; }
 .btn-row { margin-top: 14px; }
 .chips-step { margin-top: 16px; }
 .chips-step .chips { margin-top: 0; }
+.step-num { display: inline-flex; align-items: baseline; gap: 4px; }
+.step-num input { width: 64px; height: 44px; padding: 0 6px; border: 1.5px solid var(--line); border-radius: 12px; background: #fff; color: var(--ink); font-family: inherit; font-size: 19px; font-weight: 700; text-align: center; }
+.step-num input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.step-num span { font-size: 15px; font-weight: 700; }

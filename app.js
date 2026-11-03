@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   var C = self.RepiCore, DB = self.RepiDB;
-  var APP_VERSION = '1.1.0';
+  var APP_VERSION = '1.1.1';
   var SITES = { amazon: 'Amazon', yodobashi: 'ヨドバシ.com', rakuten: '楽天', other: 'その他' };
   var SITE_KEYS = Object.keys(SITES);
   var DEFAULT_CATS = ['飲料', '食品', '洗剤・掃除', '紙類', '衛生用品', 'その他'];
@@ -486,7 +486,7 @@
       '<button class="btn-ghost" data-action="addBrand" data-id="' + eid + '">' + ICON.plus + '銘柄を追加</button></div></section>' +
       brands +
       (e.must ? '<section class="card"><h2>周期と通知</h2><div class="steps">' +
-        '<div class="step"><span>買う周期</span><div class="stepper"><button data-action="cycle" data-d="-1" data-id="' + eid + '" aria-label="1日減らす">−</button><b>' + e.cycle + '日ごと</b><button data-action="cycle" data-d="1" data-id="' + eid + '" aria-label="1日増やす">＋</button></div>' +
+        '<div class="step"><span>買う周期</span><div class="stepper"><button data-action="cycle" data-d="-1" data-id="' + eid + '" aria-label="1日減らす">−</button><label class="step-num"><input id="d-cycle" type="number" min="1" max="365" inputmode="numeric" enterkeyhint="done" value="' + e.cycle + '" data-id="' + eid + '" aria-label="買う周期（日数）"><span>日ごと</span></label><button data-action="cycle" data-d="1" data-id="' + eid + '" aria-label="1日増やす">＋</button></div>' +
         '</div>' +
         '<div class="step"><span>通知のタイミング</span><div class="stepper"><button data-action="notify" data-d="-1" data-id="' + eid + '" aria-label="1日減らす">−</button><b>' + nb + '</b><button data-action="notify" data-d="1" data-id="' + eid + '" aria-label="1日増やす">＋</button></div></div>' +
         '</div><div class="step chips-step"><span>よく使う周期</span>' + cycleChips('setCycle', e.cycle, eid) + '</div>' + suggestHtml + '</section>' : '') +
@@ -1244,6 +1244,17 @@
     } else if (t.id === 'qs' || t.id === 'qe') {
       state.settings[t.id === 'qs' ? 'quietStart' : 'quietEnd'] = parseInt(t.value, 10);
       persist(); render(); toast('保存しました');
+    } else if (t.id === 'd-cycle') {
+      var ce = getItem(t.dataset.id);
+      if (ce) {
+        var nv = clampInt(t.value, 1, 365, ce.cycle);
+        if (nv !== ce.cycle) {
+          ce.cycle = nv;
+          if (ce.notifyBefore > ce.cycle) ce.notifyBefore = ce.cycle;
+          persist(); toast(ce.cycle + '日ごとにしました');
+        }
+        render();
+      }
     } else if (t.name === 'confirmMode') {
       state.settings.confirmMode = CONFIRM_MODES.indexOf(t.value) >= 0 ? t.value : 'ask';
       persist(); toast('保存しました');
