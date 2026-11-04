@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   var C = self.RepiCore, DB = self.RepiDB;
-  var APP_VERSION = '1.1.4';
+  var APP_VERSION = '1.1.5';
   var SITES = { amazon: 'Amazon', yodobashi: 'ヨドバシ.com', rakuten: '楽天', other: 'その他' };
   var SITE_KEYS = Object.keys(SITES);
   var DEFAULT_CATS = ['飲料', '食品', '洗剤・掃除', '紙類', '衛生用品', 'その他'];
@@ -422,6 +422,15 @@
     if (stale.length) html += sub('最近買っていない', '通知を止めています。買うと元に戻ります', stale);
     return html;
   }
+  /* 前回購入日と、そこから何日たったか */
+  function agoText(last) {
+    var d = C.diffDays(C.todayStr(), last);
+    return d <= 0 ? '今日' : d + '日前';
+  }
+  function lastLine(s) {
+    if (!s.last) return '<div class="last-line muted">まだ購入していません</div>';
+    return '<div class="last-line"><span class="muted">前回購入</span> ' + fmtMDW(s.last) + ' <span class="ago">' + agoText(s.last) + '</span></div>';
+  }
   function brandLine(e) {
     if (!multi(e)) return '';
     return '<div class="brand-line"><span>' + esc(e.name) + ' ・ 銘柄' + e.variants.length + '</span><button class="link-btn" data-action="brands" data-id="' + esc(e.id) + '">ほかの銘柄</button></div>';
@@ -431,14 +440,14 @@
     var snooze = (s.level !== 'calm' && !s.never) ? '<button class="link-btn" data-action="snooze" data-id="' + id + '">まだある</button>' : '';
     return '<div class="row"><a class="thumb" href="#item-' + id + '" style="background:' + tintOf(v.id) + '" aria-label="' + esc(v.name) + 'の詳細">' + thumbInner(v, e.category) + '</a>' +
       '<div class="row-body"><div class="row-top"><span class="no">' + n + '</span><span class="site">' + siteLabel(v) + '</span><span class="times">購入' + e.history.length + '回</span>' + snooze + '</div>' +
-      '<a class="row-name" href="#item-' + id + '">' + esc(v.name) + '</a>' + brandLine(e) +
+      '<a class="row-name" href="#item-' + id + '">' + esc(v.name) + '</a>' + brandLine(e) + lastLine(s) +
       '<div class="row-meta"><span>' + yen(vLastPrice(e, v)) + '</span><span class="tag ' + s.level + '">' + s.label + '</span>' +
       '<a class="btn-buy ' + s.level + '" ' + buyAttrs(e, v) + '>購入する</a></div></div></div>';
   }
   function cardHtml(x) {
     var e = x.e, v = curVariant(e), id = esc(e.id);
     return '<div class="occ-card"><a class="thumb" href="#item-' + id + '" style="background:' + tintOf(v.id) + '" aria-label="' + esc(v.name) + 'の詳細">' + thumbInner(v, e.category) + '</a>' +
-      '<div class="occ-body"><a class="row-name" href="#item-' + id + '">' + esc(v.name) + '</a><span class="occ-meta">' + siteLabel(v) + ' ・ 購入' + e.history.length + '回 ・ ' + x.s.label + '</span></div>' +
+      '<div class="occ-body"><a class="row-name" href="#item-' + id + '">' + esc(v.name) + '</a><span class="occ-meta">' + siteLabel(v) + ' ・ 購入' + e.history.length + '回</span>' + lastLine(x.s) + '</div>' +
       '<a class="btn-buy occ" ' + buyAttrs(e, v) + '>購入する</a></div>';
   }
   function shareHowTo() {
@@ -502,7 +511,7 @@
       '<dt>カテゴリー</dt><dd>' + esc(e.category) + '</dd>' +
       '<dt>購入回数</dt><dd><b>' + e.history.length + '回</b></dd>' +
       '<dt>前回価格</dt><dd><b>' + yen(lp) + '</b>' + diff + '</dd>' +
-      '<dt>前回購入</dt><dd>' + (s.last ? fmtLong(s.last) : '—') + '</dd>' +
+      '<dt>前回購入</dt><dd>' + (s.last ? fmtLong(s.last) + ' <span class="ago">' + agoText(s.last) + '</span>' : 'まだ購入していません') + '</dd>' +
       (e.must && !s.never && s.level !== 'stale' ? '<dt>次の買いどき</dt><dd><b>' + fmtLong(s.due) + '</b></dd>' : '') + '</dl>' +
       (s.level === 'stale' ? '<p class="note stale-note">しばらく買っていないため、通知を止めています。また買うと元に戻ります。</p>' : '') +
       (!v.image ? '<p class="note">写真は、Chromeで商品写真を長押し→「画像をダウンロード」してから、「写真を選ぶ」で付けられます。</p>' : '') +
@@ -535,7 +544,7 @@
         g.items.map(function (e) {
           var s = status(e), v = curVariant(e);
           return '<a class="grow" href="#item-' + esc(e.id) + '"><span class="thumb sm" style="background:' + tintOf(v.id) + '">' + thumbInner(v, e.category) + '</span>' +
-            '<span class="g-name">' + esc(v.name) + '<small>' + (multi(e) ? esc(e.name) + '（銘柄' + e.variants.length + '）・ ' : '') + siteLabel(v) + ' ・ ' + (e.must ? e.cycle + '日ごと' : 'たまに買う') + ' ・ 購入' + e.history.length + '回</small></span>' +
+            '<span class="g-name">' + esc(v.name) + '<small>' + (multi(e) ? esc(e.name) + '（銘柄' + e.variants.length + '）・ ' : '') + siteLabel(v) + ' ・ ' + (e.must ? e.cycle + '日ごと' : 'たまに買う') + ' ・ 購入' + e.history.length + '回' + (s.last ? ' ・ 前回 ' + fmtMD(s.last) + '（' + agoText(s.last) + '）' : '') + '</small></span>' +
             '<span class="tag ' + s.level + '">' + s.label + '</span></a>';
         }).join('') + '</div></section>';
     }).join('') : emptyState();
